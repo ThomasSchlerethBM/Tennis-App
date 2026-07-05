@@ -1,0 +1,1980 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>U9 Kleinfeld Live-Tracker</title>
+
+<!-- React -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<!-- Babel Standalone: transforms the JSX below directly in the browser, no build step needed -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Firebase (compat SDK — simplest to use without a bundler) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+
+<!-- QR code generation (client-side, renders into a div, no external service) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+<style>
+  html, body { margin:0; padding:0; }
+  #root { min-height:100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // ============================================================
+  // 1) FIREBASE SETUP — filled in with your project's config.
+  //    (apiKey is safe to expose client-side for Firebase; access control
+  //    happens via the Realtime Database Security Rules, not by hiding it.)
+  // ============================================================
+  const firebaseConfig = {
+    apiKey: "AIzaSyDXdNNL0oTD9b-1V-gmu581uCEOGun_p7E",
+    authDomain: "tennis-app-41d31.firebaseapp.com",
+    databaseURL: "https://tennis-app-41d31-default-rtdb.europe-west1.firebasedatabase.app",
+    projectId: "tennis-app-41d31",
+    storageBucket: "tennis-app-41d31.firebasestorage.app",
+    messagingSenderId: "48171140394",
+    appId: "1:48171140394:web:00945a4dd93aad21e40a53",
+    measurementId: "G-X1X6PXN522"
+  };
+
+  // Defensive check: if this shows up, the Firebase/React CDN scripts above
+  // didn't load. Almost always this means the page was opened inside a
+  // sandboxed preview (e.g. an in-chat "preview" panel) that blocks
+  // external network requests — this page MUST be opened as a real
+  // webpage: either double-click index.html locally, or host it (GitHub
+  // Pages etc.). It will NOT work inside Claude's own artifact/file preview.
+  if (typeof firebase === "undefined") {
+    document.getElementById("root").innerHTML =
+      '<div style="font-family:sans-serif;max-width:480px;margin:60px auto;padding:20px;' +
+      'border:2px solid #C1272D;border-radius:10px;color:#132A20;line-height:1.5;">' +
+      '<strong>Firebase konnte nicht geladen werden.</strong><br><br>' +
+      'Diese Seite braucht echten Internetzugriff auf firebase-Skripte von gstatic.com. ' +
+      'Öffne die Datei direkt im Browser (Doppelklick auf index.html) oder lade sie z.B. ' +
+      'auf GitHub Pages hoch — eine Vorschau innerhalb von Claude selbst blockiert externe ' +
+      'Netzwerkaufrufe und funktioniert hier nicht.</div>';
+    throw new Error("Firebase SDK not loaded — see on-page message.");
+  }
+
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.database();
+</script>
+
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ---------- constants ---------- */
+
+const EX_DEFS = [
+  { key: "A", name: "Koordinationsslalom", mode: "time", unit: "s", desc: "Ball auf dem Schläger im Slalom balancieren – schnelleres Team gewinnt." },
+  { key: "B", name: "Zielwurfstaffel", mode: "time", unit: "s", desc: "Acht Bälle nacheinander in den Eimer treffen – schnelleres Team gewinnt." },
+  { key: "C", name: "Einbeinsprung", mode: "distance", unit: "cm", desc: "Drei Sprünge auf einem Bein, gemeinsame Weite – weiteres Team gewinnt." },
+];
+
+const MATCH_DEFS = [
+  { id: "e1", type: "einzel", label: "Einzel 1", round: 1, pos: 2 },
+  { id: "e2", type: "einzel", label: "Einzel 2", round: 1, pos: 4 },
+  { id: "e3", type: "einzel", label: "Einzel 3", round: 2, pos: 1 },
+  { id: "e4", type: "einzel", label: "Einzel 4", round: 2, pos: 3 },
+  { id: "d1", type: "doppel", label: "Doppel 1" },
+  { id: "d2", type: "doppel", label: "Doppel 2" },
+];
+
+const STORAGE_KEY = "u9-kleinfeld-state-v1"; // legacy, unused since storage split into per-slice shared keys
+
+/* ---------- helpers: tennis scoring engine ---------- */
+
+function freshSet(isMTB = false) {
+  return { heimGames: 0, gastGames: 0, tbHeim: 0, tbGast: 0, inTB: false, finished: false, winner: null, isMTB };
+}
+function freshLive() {
+  return {
+    sets: [freshSet()],
+    setIndex: 0,
+    points: { heim: 0, gast: 0 },
+    winner: null,
+    wo: null,
+    serveConfig: { firstServer: null, heimStartsNear: null },
+    sideChangeCount: 0,
+  };
+}
+function normalizeLive(live) {
+  if (!live) return freshLive();
+  return {
+    ...live,
+    serveConfig: live.serveConfig || { firstServer: null, heimStartsNear: null },
+    sideChangeCount: typeof live.sideChangeCount === "number" ? live.sideChangeCount : 0,
+  };
+}
+function otherTeam(t) {
+  return t === "heim" ? "gast" : "heim";
+}
+function currentServerTeam(live) {
+  const cfg = live.serveConfig;
+  if (!cfg || !cfg.firstServer) return null;
+  let completedGames = 0;
+  live.sets.forEach((s, idx) => {
+    if (idx === live.setIndex || s.isMTB) return;
+    completedGames += s.heimGames + s.gastGames;
+  });
+  const cs = live.sets[live.setIndex];
+  if (!cs.isMTB) completedGames += cs.heimGames + cs.gastGames;
+  const base = completedGames % 2 === 0 ? cfg.firstServer : otherTeam(cfg.firstServer);
+  if (cs.inTB || cs.isMTB) {
+    const pts = cs.tbHeim + cs.tbGast;
+    if (pts === 0) return base;
+    const turn = Math.floor((pts + 1) / 2) % 2;
+    return turn === 0 ? base : otherTeam(base);
+  }
+  return base;
+}
+function currentHeimNear(live) {
+  const cfg = live.serveConfig;
+  if (!cfg || cfg.heimStartsNear === null || cfg.heimStartsNear === undefined) return true;
+  const swapped = live.sideChangeCount % 2 === 1;
+  return swapped ? !cfg.heimStartsNear : cfg.heimStartsNear;
+}
+function clone(o) {
+  return JSON.parse(JSON.stringify(o));
+}
+
+function advanceAfterSet(st) {
+  const finished = st.sets.filter((s) => s.finished);
+  const heimSets = finished.filter((s) => s.winner === "heim").length;
+  const gastSets = finished.filter((s) => s.winner === "gast").length;
+  if (heimSets === 2) { st.winner = "heim"; return; }
+  if (gastSets === 2) { st.winner = "gast"; return; }
+  if (heimSets === 1 && gastSets === 1) {
+    st.sets.push(freshSet(true));
+    st.setIndex = st.sets.length - 1;
+    return;
+  }
+  st.sets.push(freshSet(false));
+  st.setIndex = st.sets.length - 1;
+}
+
+function addPoint(live, side) {
+  if (live.winner || live.wo) return live;
+  const st = clone(live);
+  const cs = st.sets[st.setIndex];
+
+  if (cs.isMTB) {
+    if (side === "heim") cs.tbHeim++; else cs.tbGast++;
+    const a = cs.tbHeim, b = cs.tbGast;
+    const lead = side === "heim" ? a - b : b - a;
+    const val = side === "heim" ? a : b;
+    if (val >= 10 && lead >= 2) { cs.finished = true; cs.winner = side; st.winner = side; }
+    return st;
+  }
+  if (cs.inTB) {
+    if (side === "heim") cs.tbHeim++; else cs.tbGast++;
+    const a = cs.tbHeim, b = cs.tbGast;
+    const lead = side === "heim" ? a - b : b - a;
+    const val = side === "heim" ? a : b;
+    if (val >= 7 && lead >= 2) { cs.finished = true; cs.winner = side; advanceAfterSet(st); }
+    return st;
+  }
+  st.points[side]++;
+  if (st.points[side] === 4) {
+    if (side === "heim") cs.heimGames++; else cs.gastGames++;
+    st.points = { heim: 0, gast: 0 };
+    const gh = cs.heimGames, gg = cs.gastGames;
+    if (gh >= 4 && gh - gg >= 2) { cs.finished = true; cs.winner = "heim"; advanceAfterSet(st); }
+    else if (gg >= 4 && gg - gh >= 2) { cs.finished = true; cs.winner = "gast"; advanceAfterSet(st); }
+    else if (gh === 4 && gg === 4) { cs.inTB = true; }
+  }
+  return st;
+}
+
+function setWalkover(live, absentSide) {
+  const st = clone(live);
+  st.wo = absentSide;
+  st.winner = absentSide === "heim" ? "gast" : "heim";
+  return st;
+}
+
+const PT_LABEL = ["0", "15", "30", "40"];
+
+function serveSideOf(live) {
+  const cs = live.sets[live.setIndex];
+  const sum = (cs.isMTB || cs.inTB) ? cs.tbHeim + cs.tbGast : live.points.heim + live.points.gast;
+  return sum % 2 === 0 ? "rechts" : "links";
+}
+
+function pointLabel(live) {
+  const cs = live.sets[live.setIndex];
+  if (cs.isMTB) return `${cs.tbHeim} : ${cs.tbGast}`;
+  if (cs.inTB) return `${cs.tbHeim} : ${cs.tbGast}`;
+  return `${PT_LABEL[live.points.heim]} : ${PT_LABEL[live.points.gast]}`;
+}
+
+function setScoreStr(s) {
+  if (s.isMTB) return `${s.tbHeim}:${s.tbGast}`;
+  let str = `${s.heimGames}:${s.gastGames}`;
+  if (s.inTB || (s.finished && (s.tbHeim || s.tbGast))) str += ` (TB ${s.tbHeim}:${s.tbGast})`;
+  return str;
+}
+
+function matchTally(live) {
+  // returns {heimSets, gastSets, heimGames, gastGames}
+  let heimSets = 0, gastSets = 0, heimGames = 0, gastGames = 0;
+  live.sets.forEach((s) => {
+    if (s.finished) {
+      if (s.winner === "heim") heimSets++; else if (s.winner === "gast") gastSets++;
+      if (!s.isMTB) { heimGames += s.heimGames; gastGames += s.gastGames; }
+    }
+  });
+  return { heimSets, gastSets, heimGames, gastGames };
+}
+
+/* ---------- default state ---------- */
+
+function defaultPlayers(n) {
+  return Array.from({ length: n }, (_, i) => ({ pos: i + 1, name: "" }));
+}
+
+function defaultState() {
+  return {
+    meta: {
+      liga: "",
+      gruppe: "",
+      berichtNr: "",
+      termin: "",
+      heimName: "",
+      gastName: "",
+    },
+    players: {
+      heim: defaultPlayers(4),
+      gast: defaultPlayers(4),
+    },
+    clubs: [],
+    motorik: EX_DEFS.reduce((acc, e) => {
+      acc[e.key] = { heim: "", gast: "", manualWinner: null };
+      return acc;
+    }, {}),
+    doubles: {
+      d1: { heim: [1, 2], gast: [1, 2] },
+      d2: { heim: [3, 4], gast: [3, 4] },
+    },
+    matches: MATCH_DEFS.reduce((acc, m) => {
+      acc[m.id] = { live: freshLive(), history: [] };
+      return acc;
+    }, {}),
+  };
+}
+
+/* ---------- motorik winner logic (shared) ---------- */
+
+function computeExWinner(ex, v) {
+  if (v.manualWinner) return v.manualWinner; // 'heim' | 'gast' | 'draw' set explicitly, overrides measured values
+  const hasBoth = v.heim !== "" && v.gast !== "";
+  if (!hasBoth) return null;
+  const hv = parseFloat(v.heim), gv = parseFloat(v.gast);
+  if (hv === gv) return "draw";
+  if (ex.mode === "time") return hv < gv ? "heim" : "gast";
+  return hv > gv ? "heim" : "gast";
+}
+
+/* ---------- import helpers (paste from BTV pages) ---------- */
+
+function parseRosterText(text) {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => {
+      const m = l.match(/^(?:Nr\.?\s*)?(\d{1,2})[.):]?\s+(.*)$/);
+      return m ? m[2].trim() : l;
+    })
+    .filter(
+      (name) =>
+        name.length > 1 &&
+        !/^(Name|Vorname|Spieler|Meldeliste|Position|ID-Nr\.?)/i.test(name)
+    );
+}
+
+// Handles a full paste of the BTV "Rangliste" table (Rang | LK | ID-Nummer |
+// Name, Vorname (Jahrgang) | Nation | SG | Einzel | Doppel | Gesamt) — pulls
+// out just "Nachname, Vorname" per row and sorts by the Rang column, so it
+// doesn't matter in what order the rows were selected/pasted.
+function parseRosterSmart(text) {
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const nameRe = /([A-ZÄÖÜ][\wäöüßÄÖÜ.\-]*(?:\s[A-ZÄÖÜ][\wäöüßÄÖÜ.\-]*)?,\s*[A-ZÄÖÜ][\wäöüßÄÖÜ.\-]*(?:\s[A-ZÄÖÜ][\wäöüßÄÖÜ.\-]*)?)/;
+  const ranked = [];
+  lines.forEach((line) => {
+    const rankMatch = line.match(/^(\d{1,3})\b/);
+    const nameMatch = line.match(nameRe);
+    if (rankMatch && nameMatch) {
+      ranked.push({ rank: parseInt(rankMatch[1], 10), name: nameMatch[1].trim() });
+    }
+  });
+  if (ranked.length) {
+    ranked.sort((a, b) => a.rank - b.rank);
+    return ranked.map((r) => r.name);
+  }
+  return parseRosterText(text);
+}
+
+function parseClubNames(text) {
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const clubs = new Set();
+  lines.forEach((l) => {
+    const matches = l.match(/([A-ZÄÖÜ][\wäöüßÄÖÜ.\-\s]{2,45}?\(\d{4,6}\))/g);
+    if (matches) matches.forEach((m) => clubs.add(m.trim()));
+  });
+  if (clubs.size === 0) {
+    lines.forEach((l) => {
+      if (l.length > 2 && l.length < 60 && !/^(Gruppe|Tabelle|Platz|Spieltag|Termin|Rang|Verein)/i.test(l)) {
+        clubs.add(l);
+      }
+    });
+  }
+  return Array.from(clubs);
+}
+
+/* ---------- storage helpers ----------
+   Data is split into small shared keys instead of one big blob so that
+   parents/trainers scoring different matches on different phones at the
+   same time don't overwrite each other's changes. Each match lives in its
+   own key/path in the Firebase Realtime Database. */
+
+const SHARED_KEYS = { meta: "u9-meta", players: "u9-players", clubs: "u9-clubs", motorik: "u9-motorik", doubles: "u9-doubles" };
+const ADMIN_LOCAL_KEY = "u9-admin-auth";
+const ADMIN_PASSWORD = "1234";
+
+function matchKey(id) {
+  return `u9-match-${id}`;
+}
+
+// one-off read/write (used for the admin-password-protected screens, which
+// don't need a live subscription — Setup/Motorik/Bericht just read+write
+// on demand, same as before)
+async function getShared(key) {
+  try {
+    const snap = await db.ref(key).once("value");
+    return snap.exists() ? snap.val() : null;
+  } catch (e) { return null; }
+}
+async function setShared(key, value) {
+  try { await db.ref(key).set(value); } catch (e) { /* ignore, e.g. offline */ }
+}
+
+// live subscription: fires immediately with the current value, then again
+// every time ANY device changes that path. Returns an unsubscribe function.
+function subscribeShared(key, onChange) {
+  const ref = db.ref(key);
+  const cb = ref.on("value", (snap) => onChange(snap.exists() ? snap.val() : null));
+  return () => ref.off("value", cb);
+}
+
+// admin unlock is a per-device preference, not shared data — plain
+// localStorage is fine here since this runs as a normal hosted page
+// (no sandbox restrictions like inside a Claude artifact).
+function loadAdminAuth() {
+  try { return localStorage.getItem(ADMIN_LOCAL_KEY) === "true"; } catch (e) { return false; }
+}
+function setAdminAuth(v) {
+  try { localStorage.setItem(ADMIN_LOCAL_KEY, v ? "true" : "false"); } catch (e) { /* ignore */ }
+}
+
+/* ---------- small UI atoms ---------- */
+
+function Chip({ children, tone = "default" }) {
+  return <span className={`chip chip-${tone}`}>{children}</span>;
+}
+
+function TeamLabel({ side }) {
+  return <span className={`side-tag side-${side}`}>{side === "heim" ? "Heim" : "Gast"}</span>;
+}
+
+/* ---------- QR code box (renders a scannable code for a match link) ---------- */
+
+function QRCodeBox({ url }) {
+  const boxRef = useRef(null);
+
+  useEffect(() => {
+    if (!boxRef.current || typeof QRCode === "undefined") return;
+    boxRef.current.innerHTML = "";
+    new QRCode(boxRef.current, {
+      text: url,
+      width: 180,
+      height: 180,
+      colorDark: "#0A4A2B",
+      colorLight: "#ffffff",
+      correctLevel: QRCode.CorrectLevel.M,
+    });
+  }, [url]);
+
+  return (
+    <div className="qr-box">
+      <div ref={boxRef} className="qr-canvas-wrap" />
+      <p className="hint qr-hint">Mit dem Handy scannen, um direkt bei diesem Spiel live mitzupunkten.</p>
+    </div>
+  );
+}
+
+/* ---------- Court position indicator (persistent, not a popup) ---------- */
+
+function CourtPositionIndicator({ live, serverTeam, heimNear }) {
+  const [flipped, setFlipped] = useState(false);
+  const [flippedRows, setFlippedRows] = useState(false);
+  const side = serveSideOf(live); // "rechts" (Deuce) or "links" (Ad)
+  const rightActive = side === "rechts";
+
+  // rotated 90°: the net runs vertically (as seen by someone standing at
+  // net height looking along it), the two baselines are left/right instead
+  // of top/bottom. "flipped" mirrors left/right, "flippedRows" mirrors
+  // top/bottom — both are just personal viewing-angle preferences, since
+  // people watch from different spots around the court.
+  const netX = 150, midY = 106, left = 14, right = 286, top = 30, bottom = 182;
+  const colW = netX - left;
+  const rowH = midY - top;
+
+  const effectiveHeimNear = flipped ? !heimNear : heimNear;
+  const leftTeam = effectiveHeimNear ? "heim" : "gast";
+  const server = serverTeam || "heim";
+  const returner = otherTeam(server);
+
+  const serverX = server === leftTeam ? left : netX;
+  const returnerX = returner === leftTeam ? left : netX;
+  const rightIsTop = flippedRows ? false : true;
+  const serverY = rightActive === rightIsTop ? top : midY;
+  const returnerY = rightActive === rightIsTop ? midY : top;
+
+  const teamColor = (t) => (t === "heim" ? "#0E6B3E" : "#0072BC");
+  const teamLabel = (t) => (t === "heim" ? "Heim" : "Gast");
+
+  const serverBox = { x: serverX, y: serverY, w: colW, h: rowH };
+  const returnerBox = { x: returnerX, y: returnerY, w: colW, h: rowH };
+
+  return (
+    <div className="court-indicator">
+      <svg viewBox="0 0 300 190" className="court-svg" role="img" aria-label={`Aufschlag ${teamLabel(server)} von ${side}`}>
+        <rect x={left} y={top} width={right - left} height={bottom - top} rx="6" fill="#C0392B" stroke="#ffffff" strokeWidth="3" />
+        <rect x={serverBox.x} y={serverBox.y} width={serverBox.w} height={serverBox.h} fill={teamColor(server)} fillOpacity="0.6" />
+        <rect x={returnerBox.x} y={returnerBox.y} width={returnerBox.w} height={returnerBox.h} fill={teamColor(returner)} fillOpacity="0.6" />
+        <line x1={left} y1={midY} x2={right} y2={midY} stroke="#ffffff" strokeWidth="2.5" />
+        <line x1={netX} y1={top} x2={netX} y2={bottom} stroke="#ffffff" strokeWidth="5" />
+        <text x={serverBox.x + serverBox.w / 2} y={serverBox.y + serverBox.h / 2 + 8} textAnchor="middle" fontFamily="Oswald, sans-serif" fontWeight="700" fontSize="22" fill="#fff">A</text>
+        <text x={returnerBox.x + returnerBox.w / 2} y={returnerBox.y + returnerBox.h / 2 + 8} textAnchor="middle" fontFamily="Oswald, sans-serif" fontWeight="700" fontSize="22" fill="#fff">R</text>
+        <line x1={netX} y1="4" x2={netX} y2={top - 2} stroke="#132A20" strokeWidth="2" />
+        <rect x={netX - 22} y="2" width="44" height="16" rx="3" fill="#132A20" />
+        <text x={netX} y="14" textAnchor="middle" fontFamily="Inter, sans-serif" fontWeight="600" fontSize="10" fill="#fff">Netz</text>
+        <text x={left + 4} y={bottom - 6} fontFamily="Inter, sans-serif" fontSize="9" fill="#fff" opacity="0.85">{effectiveHeimNear ? "Heim" : "Gast"}</text>
+        <text x={right - 4} y={bottom - 6} textAnchor="end" fontFamily="Inter, sans-serif" fontSize="9" fill="#fff" opacity="0.85">{effectiveHeimNear ? "Gast" : "Heim"}</text>
+      </svg>
+      <div className="court-caption">
+        <span className="court-legend"><span className="court-dot-legend" style={{ background: teamColor(server) }} /> Aufschläger: {teamLabel(server)} – von <strong>{side}</strong></span>
+        <span className="court-legend"><span className="court-dot-legend" style={{ background: teamColor(returner) }} /> Rückschläger: {teamLabel(returner)} – diagonal gegenüber</span>
+      </div>
+      <div className="court-flip-row">
+        <button className="btn btn-small btn-ghost" onClick={() => setFlipped((f) => !f)}>↔️ Seiten tauschen</button>
+        <button className="btn btn-small btn-ghost" onClick={() => setFlippedRows((f) => !f)}>↕️ Ansicht drehen</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- pre-match serve/side setup modal ---------- */
+
+function ServeSetupModal({ names, onConfirm }) {
+  const [firstServer, setFirstServer] = useState(null);
+
+  if (!firstServer) {
+    return (
+      <div className="deuce-backdrop">
+        <div className="deuce-modal">
+          <div className="deuce-title">Wer schlägt zuerst auf?</div>
+          <p className="deuce-text">Bevor es losgeht: welches Team hat den ersten Aufschlag?</p>
+          <div className="serve-setup-btns">
+            <button className="btn btn-heim btn-block" onClick={() => setFirstServer("heim")}>{names.heim} (Heim)</button>
+            <button className="btn btn-gast btn-block" onClick={() => setFirstServer("gast")}>{names.gast} (Gast)</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="deuce-backdrop">
+      <div className="deuce-modal">
+        <div className="deuce-title">Auf welcher Seite steht Heim?</div>
+        <p className="deuce-text">In der Positions-Grafik unten: Auf welcher Seite startet {names.heim} (Heim)?</p>
+        <div className="serve-setup-btns">
+          <button className="btn btn-accent btn-block" onClick={() => onConfirm({ firstServer, heimStartsNear: true })}>Heim: linke Seite</button>
+          <button className="btn btn-outline btn-block" onClick={() => onConfirm({ firstServer, heimStartsNear: false })}>Heim: rechte Seite</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Stopwatch ---------- */
+
+function Stopwatch({ value, onChange, side }) {
+  const [running, setRunning] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const startRef = useRef(null);
+  const rafRef = useRef(null);
+
+  useEffect(() => {
+    if (!running) return;
+    const tick = () => {
+      setElapsed((Date.now() - startRef.current) / 1000);
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    startRef.current = Date.now() - elapsed * 1000;
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
+
+  const start = () => setRunning(true);
+  const stop = () => {
+    setRunning(false);
+    onChange(elapsed.toFixed(1));
+  };
+  const reset = () => { setRunning(false); setElapsed(0); onChange(""); };
+
+  return (
+    <div className="stopwatch">
+      <div className="stopwatch-time">{elapsed.toFixed(1)}s</div>
+      <div className="stopwatch-btns">
+        {!running ? (
+          <button className="btn btn-small btn-accent" onClick={start}>Start</button>
+        ) : (
+          <button className="btn btn-small btn-stop" onClick={stop}>Stopp</button>
+        )}
+        <button className="btn btn-small btn-ghost" onClick={reset}>Reset</button>
+      </div>
+      {value !== "" && !running && <div className="stopwatch-saved">Gespeichert: {value}s</div>}
+    </div>
+  );
+}
+
+/* ---------- Setup Screen ---------- */
+
+function SetupScreen({ state, setState, onLockAdmin }) {
+  const updateMeta = (k, v) => setState((s) => ({ ...s, meta: { ...s.meta, [k]: v } }));
+
+  const resetEverything = () => {
+    const sure = window.confirm(
+      "Wirklich ALLES zurücksetzen?\n\nDas löscht unwiderruflich für ALLE Geräte: Mannschaften, Spieler, Vereinsverzeichnis, Motorik-Ergebnisse, Doppel-Aufstellungen und alle 6 Spielstände.\n\nDas kann nicht rückgängig gemacht werden."
+    );
+    if (!sure) return;
+    const sureAgain = window.confirm("Ganz sicher? Letzte Bestätigung.");
+    if (!sureAgain) return;
+
+    const base = defaultState();
+    setShared(SHARED_KEYS.meta, base.meta);
+    setShared(SHARED_KEYS.players, base.players);
+    setShared(SHARED_KEYS.clubs, base.clubs);
+    setShared(SHARED_KEYS.motorik, base.motorik);
+    setShared(SHARED_KEYS.doubles, base.doubles);
+    MATCH_DEFS.forEach((d) => setShared(matchKey(d.id), base.matches[d.id]));
+    setState(base);
+  };
+
+  const updatePlayer = (side, idx, field, value) => {
+    setState((s) => {
+      const list = s.players[side].map((p, i) => (i === idx ? { ...p, [field]: value } : p));
+      return { ...s, players: { ...s.players, [side]: list } };
+    });
+  };
+  const movePlayer = (side, idx, dir) => {
+    setState((s) => {
+      const arr = [...s.players[side]];
+      const target = idx + dir;
+      if (target < 0 || target >= arr.length) return s;
+      const nameA = arr[idx].name, nameB = arr[target].name;
+      arr[idx] = { ...arr[idx], name: nameB };
+      arr[target] = { ...arr[target], name: nameA };
+      return { ...s, players: { ...s.players, [side]: arr } };
+    });
+  };
+  const addPlayer = (side) => {
+    setState((s) => {
+      if (s.players[side].length >= 8) return s;
+      const nextPos = s.players[side].length + 1;
+      return { ...s, players: { ...s.players, [side]: [...s.players[side], { pos: nextPos, name: "" }] } };
+    });
+  };
+  const removePlayer = (side) => {
+    setState((s) => {
+      if (s.players[side].length <= 4) return s;
+      return { ...s, players: { ...s.players, [side]: s.players[side].slice(0, -1) } };
+    });
+  };
+  const applyRoster = (side, names) => {
+    setState((s) => {
+      const n = Math.max(4, Math.min(8, names.length || 4));
+      const list = Array.from({ length: n }, (_, i) => ({ pos: i + 1, name: names[i] || "" }));
+      return { ...s, players: { ...s.players, [side]: list } };
+    });
+  };
+  const addClub = (name) => {
+    if (!name || !name.trim()) return;
+    setState((s) => (s.clubs.includes(name) ? s : { ...s, clubs: [...s.clubs, name.trim()] }));
+  };
+  const mergeClubs = (names) => {
+    setState((s) => {
+      const set = new Set(s.clubs);
+      names.forEach((n) => set.add(n));
+      return { ...s, clubs: Array.from(set) };
+    });
+  };
+
+  const [importOpen, setImportOpen] = useState({ heim: false, gast: false });
+  const [rosterText, setRosterText] = useState({ heim: "", gast: "" });
+  const [clubOpen, setClubOpen] = useState(false);
+  const [clubText, setClubText] = useState("");
+  const [newClub, setNewClub] = useState("");
+
+  return (
+    <div className="screen">
+      <div className="screen-title-row">
+        <h2 className="screen-title">Mannschaften &amp; Spiel</h2>
+        <button className="btn btn-small btn-ghost" onClick={onLockAdmin}>Admin abmelden</button>
+      </div>
+
+      <div className="card">
+        <div className="field-row">
+          <label>Liga / Gruppe</label>
+          <input value={state.meta.liga} onChange={(e) => updateMeta("liga", e.target.value)} placeholder="z.B. Südliga 2 Gr. 955" />
+        </div>
+        <div className="field-row">
+          <label>Spielbericht-Nr.</label>
+          <input value={state.meta.berichtNr} onChange={(e) => updateMeta("berichtNr", e.target.value)} placeholder="z.B. 20478" />
+        </div>
+        <div className="field-row">
+          <label>Termin</label>
+          <input type="datetime-local" value={state.meta.termin} onChange={(e) => updateMeta("termin", e.target.value)} />
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-head"><span className="ex-name">Vereinsverzeichnis</span></div>
+        <p className="hint" style={{ marginTop: 0 }}>
+          Vereine aus der{" "}
+          <a className="link" href="https://www.btv.de/de/spielbetrieb/tabelle-spielplan.html?groupid=2216839" target="_blank" rel="noreferrer">
+            Gruppenübersicht
+          </a>{" "}
+          im Browser öffnen, Tabelle markieren &amp; hier einfügen, oder einzeln hinzufügen.
+        </p>
+        {!clubOpen ? (
+          <button className="btn btn-small btn-ghost" onClick={() => setClubOpen(true)}>+ Vereine einfügen / hinzufügen</button>
+        ) : (
+          <>
+            <textarea
+              className="paste-area"
+              rows={4}
+              placeholder={"Tabelle hier einfügen, z.B.:\nTC Bad Aibling (02029)\nTC Weiß-Blau Raubling (02289)"}
+              value={clubText}
+              onChange={(e) => setClubText(e.target.value)}
+            />
+            <div className="player-actions">
+              <button
+                className="btn btn-small btn-accent"
+                onClick={() => { mergeClubs(parseClubNames(clubText)); setClubText(""); }}
+              >
+                Übernehmen
+              </button>
+              <button className="btn btn-small btn-ghost" onClick={() => setClubOpen(false)}>Schließen</button>
+            </div>
+            <div className="field-row" style={{ marginTop: 10 }}>
+              <label>Einzelnen Verein hinzufügen</label>
+              <div className="inline-add">
+                <input value={newClub} onChange={(e) => setNewClub(e.target.value)} placeholder="Vereinsname" />
+                <button className="btn btn-small btn-ghost" onClick={() => { addClub(newClub); setNewClub(""); }}>+</button>
+              </div>
+            </div>
+          </>
+        )}
+        {state.clubs.length > 0 && (
+          <div className="club-chip-list">
+            {state.clubs.map((c) => <Chip key={c}>{c}</Chip>)}
+          </div>
+        )}
+      </div>
+
+      {["heim", "gast"].map((side) => (
+        <div className="card" key={side}>
+          <div className="card-head">
+            <TeamLabel side={side} />
+            <input
+              className="team-name-input"
+              placeholder={side === "heim" ? "Heimverein" : "Gastverein"}
+              value={state.meta[side === "heim" ? "heimName" : "gastName"]}
+              onChange={(e) => updateMeta(side === "heim" ? "heimName" : "gastName", e.target.value)}
+            />
+          </div>
+          {state.clubs.length > 0 && (
+            <div className="field-row">
+              <label>Aus Vereinsverzeichnis wählen</label>
+              <select
+                value=""
+                onChange={(e) => { if (e.target.value) updateMeta(side === "heim" ? "heimName" : "gastName", e.target.value); }}
+              >
+                <option value="">– Verein wählen –</option>
+                {state.clubs.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+          )}
+
+          <div className="players-list">
+            {state.players[side].map((p, idx) => (
+              <div className="player-row" key={idx}>
+                <span className="player-pos">{p.pos}</span>
+                <input
+                  placeholder={`Spieler Position ${p.pos}`}
+                  value={p.name}
+                  onChange={(e) => updatePlayer(side, idx, "name", e.target.value)}
+                />
+                <div className="player-move-btns">
+                  <button
+                    className="btn btn-small btn-ghost player-move-btn"
+                    onClick={() => movePlayer(side, idx, -1)}
+                    disabled={idx === 0}
+                    aria-label="Nach oben"
+                  >
+                    ↑
+                  </button>
+                  <button
+                    className="btn btn-small btn-ghost player-move-btn"
+                    onClick={() => movePlayer(side, idx, 1)}
+                    disabled={idx === state.players[side].length - 1}
+                    aria-label="Nach unten"
+                  >
+                    ↓
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="player-actions">
+            <button className="btn btn-small btn-ghost" onClick={() => addPlayer(side)} disabled={state.players[side].length >= 8}>+ Spieler</button>
+            <button className="btn btn-small btn-ghost" onClick={() => removePlayer(side)} disabled={state.players[side].length <= 4}>– Spieler</button>
+          </div>
+
+          {!importOpen[side] ? (
+            <button
+              className="btn btn-small btn-ghost"
+              style={{ marginTop: 10 }}
+              onClick={() => setImportOpen((o) => ({ ...o, [side]: true }))}
+            >
+              + Kader aus BTV-{side === "heim" ? "Teamportrait" : "Meldeliste"} übernehmen
+            </button>
+          ) : (
+            <div className="import-panel">
+              <p className="hint" style={{ marginTop: 0 }}>
+                {side === "heim" ? (
+                  <>
+                    Auf der{" "}
+                    <a className="link" href="https://www.btv.de/de/spielbetrieb/teamportrait.html?teamid=3580114" target="_blank" rel="noreferrer">
+                      BTV-Teamseite
+                    </a>{" "}
+                    die ganze Rangliste (inkl. Rang, ID-Nummer, Jahrgang, Einzel/Doppel-Werten) markieren, kopieren und hier
+                    einfügen – die App zieht sich nur die Namen raus und sortiert automatisch nach Rang. Bei mehreren Seiten
+                    einfach nacheinander einfügen. Übernommen werden die ersten 4–8 (mehr Plätze gibt's aktuell nicht).
+                  </>
+                ) : (
+                  "Meldeliste oder Rangliste des Gastvereins kopieren und hier einfügen – die App erkennt Namen und Rang automatisch und sortiert entsprechend."
+                )}
+              </p>
+              <textarea
+                className="paste-area"
+                rows={5}
+                placeholder={"z.B.:\n1 Max Mustermann\n2 Lina Beispiel\n3 ...\n4 ..."}
+                value={rosterText[side]}
+                onChange={(e) => setRosterText((r) => ({ ...r, [side]: e.target.value }))}
+              />
+              <div className="player-actions">
+                <button
+                  className="btn btn-small btn-accent"
+                  onClick={() => { applyRoster(side, parseRosterSmart(rosterText[side])); setRosterText((r) => ({ ...r, [side]: "" })); setImportOpen((o) => ({ ...o, [side]: false })); }}
+                >
+                  Übernehmen
+                </button>
+                <button className="btn btn-small btn-ghost" onClick={() => setImportOpen((o) => ({ ...o, [side]: false }))}>Abbrechen</button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+
+      <p className="hint">Positionen 1–4 bilden die Stammformation für die Einzel. Zusätzliche Spieler (5–8) stehen als Ersatz bzw. für weitere Mannschaften zur Verfügung. Da die BTV-Seiten die Meldelisten per JavaScript-Widget laden, lässt sich der Kader nicht automatisch abrufen — daher der Einfüge-Weg oben.</p>
+
+      <div className="card danger-card">
+        <div className="card-head"><span className="ex-name">Gefahrenzone</span></div>
+        <p className="hint" style={{ marginTop: 0 }}>
+          Setzt Mannschaften, Vereinsverzeichnis, Motorik-Ergebnisse und alle 6 Spielstände komplett zurück – für alle
+          Geräte, die diese App gerade offen haben. Nur für einen neuen Spieltag verwenden.
+        </p>
+        <button className="btn btn-block danger-btn" onClick={resetEverything}>
+          ⚠️ Alles zurücksetzen (neuer Spieltag)
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Motorik Screen ---------- */
+
+function MotorikScreen({ state, setState }) {
+  const updateVal = (key, side, val) => {
+    setState((s) => ({ ...s, motorik: { ...s.motorik, [key]: { ...s.motorik[key], [side]: val } } }));
+  };
+  const setManualWinner = (key, winner) => {
+    setState((s) => ({ ...s, motorik: { ...s.motorik, [key]: { ...s.motorik[key], manualWinner: winner } } }));
+  };
+
+  const results = EX_DEFS.map((ex) => ({ ...ex, winner: computeExWinner(ex, state.motorik[ex.key]) }));
+
+  const points = { heim: 0, gast: 0 };
+  results.forEach((r) => {
+    if (r.winner === "heim") points.heim += 2;
+    else if (r.winner === "gast") points.gast += 2;
+    else if (r.winner === "draw") { points.heim += 1; points.gast += 1; }
+  });
+
+  return (
+    <div className="screen">
+      <h2 className="screen-title">Motorik-Wettkampf</h2>
+      {EX_DEFS.map((ex) => {
+        const v = state.motorik[ex.key];
+        const r = results.find((x) => x.key === ex.key);
+        return (
+          <div className="card" key={ex.key}>
+            <div className="card-head">
+              <span className="ex-badge">{ex.key}</span>
+              <div>
+                <div className="ex-name">{ex.name}</div>
+                <div className="ex-desc">{ex.desc}</div>
+              </div>
+            </div>
+            <div className="motorik-grid">
+              <div className="motorik-col">
+                <TeamLabel side="heim" />
+                {ex.mode === "time" ? (
+                  <Stopwatch value={v.heim} onChange={(val) => updateVal(ex.key, "heim", val)} side="heim" />
+                ) : (
+                  <div className="distance-input">
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      placeholder="cm"
+                      value={v.heim}
+                      onChange={(e) => updateVal(ex.key, "heim", e.target.value)}
+                    />
+                    <span className="unit">cm</span>
+                  </div>
+                )}
+              </div>
+              <div className="motorik-col">
+                <TeamLabel side="gast" />
+                {ex.mode === "time" ? (
+                  <Stopwatch value={v.gast} onChange={(val) => updateVal(ex.key, "gast", val)} side="gast" />
+                ) : (
+                  <div className="distance-input">
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      placeholder="cm"
+                      value={v.gast}
+                      onChange={(e) => updateVal(ex.key, "gast", e.target.value)}
+                    />
+                    <span className="unit">cm</span>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="ex-manual-row">
+              <span className="ex-manual-label">Sieger direkt festlegen:</span>
+              <div className="ex-manual-btns">
+                <button
+                  className={`btn btn-small ${v.manualWinner === "heim" ? "btn-heim" : "btn-outline"}`}
+                  onClick={() => setManualWinner(ex.key, "heim")}
+                >
+                  Heim
+                </button>
+                <button
+                  className={`btn btn-small ${v.manualWinner === "draw" ? "btn-accent" : "btn-outline"}`}
+                  onClick={() => setManualWinner(ex.key, "draw")}
+                >
+                  Gleich
+                </button>
+                <button
+                  className={`btn btn-small ${v.manualWinner === "gast" ? "btn-gast" : "btn-outline"}`}
+                  onClick={() => setManualWinner(ex.key, "gast")}
+                >
+                  Gast
+                </button>
+                {v.manualWinner && (
+                  <button className="btn btn-small btn-ghost" onClick={() => setManualWinner(ex.key, null)}>
+                    Zurücksetzen
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {r.winner && (
+              <div className="ex-result">
+                {r.winner === "draw" ? "Unentschieden – je 1 Punkt" : `${r.winner === "heim" ? "Heim" : "Gast"} gewinnt – 2 Punkte`}
+                {v.manualWinner && <span className="ex-manual-tag"> (manuell)</span>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      <div className="card total-card">
+        <div className="total-row">
+          <span>Motorik gesamt</span>
+          <span className="total-score">{points.heim} : {points.gast}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Matches list + live scorer ---------- */
+
+function playerName(state, side, pos) {
+  const p = state.players[side].find((pl) => pl.pos === pos);
+  return p && p.name ? p.name : `Pos. ${pos}`;
+}
+
+function matchPlayers(state, def) {
+  if (def.type === "einzel") {
+    return {
+      heim: playerName(state, "heim", def.pos),
+      gast: playerName(state, "gast", def.pos),
+    };
+  }
+  const dd = state.doubles[def.id];
+  return {
+    heim: dd.heim.map((p) => playerName(state, "heim", p)).join(" / "),
+    gast: dd.gast.map((p) => playerName(state, "gast", p)).join(" / "),
+  };
+}
+
+function statusOf(live) {
+  if (live.winner) return "done";
+  const played = live.sets.some((s) => s.finished) || live.points.heim || live.points.gast || live.sets[live.setIndex].heimGames || live.sets[live.setIndex].gastGames;
+  return played ? "live" : "pending";
+}
+
+function MatchesScreen({ state, setState, openMatch }) {
+  const updateDoubles = (id, side, idx, value) => {
+    setState((s) => {
+      const arr = [...s.doubles[id][side]];
+      arr[idx] = parseInt(value, 10);
+      return { ...s, doubles: { ...s.doubles, [id]: { ...s.doubles[id], [side]: arr } } };
+    });
+  };
+
+  const [linkFor, setLinkFor] = useState(null);
+  const [qrFor, setQrFor] = useState(null);
+  const shareUrl = (id) => `${window.location.href.split("#")[0]}#match=${id}`;
+  const copyLink = async (id) => {
+    const url = shareUrl(id);
+    try { await navigator.clipboard.writeText(url); } catch (e) { /* clipboard blocked, show box below instead */ }
+    setLinkFor((cur) => (cur === id ? null : id));
+  };
+
+  return (
+    <div className="screen">
+      <h2 className="screen-title">Spiele</h2>
+      {MATCH_DEFS.map((def) => {
+        const m = state.matches[def.id];
+        const names = matchPlayers(state, def);
+        const st = statusOf(m.live);
+        const t = matchTally(m.live);
+        return (
+          <div className="card match-card" key={def.id}>
+            <div className="match-card-head">
+              <span className="match-label">{def.label}</span>
+              <Chip tone={st === "done" ? "done" : st === "live" ? "live" : "pending"}>
+                {st === "done" ? "Beendet" : st === "live" ? "Läuft" : "Offen"}
+              </Chip>
+            </div>
+
+            {def.type === "doppel" && (
+              <div className="doubles-select">
+                {["heim", "gast"].map((side) => (
+                  <div className="doubles-side" key={side}>
+                    <TeamLabel side={side} />
+                    {[0, 1].map((idx) => (
+                      <select
+                        key={idx}
+                        value={state.doubles[def.id][side][idx]}
+                        onChange={(e) => updateDoubles(def.id, side, idx, e.target.value)}
+                      >
+                        {state.players[side].map((p) => (
+                          <option key={p.pos} value={p.pos}>
+                            {p.pos}. {p.name || `Pos. ${p.pos}`}
+                          </option>
+                        ))}
+                      </select>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="match-names">
+              <span>{names.heim}</span>
+              <span className="vs">vs</span>
+              <span>{names.gast}</span>
+            </div>
+
+            {(m.live.wo || m.live.winner) ? (
+              <div className="match-summary">
+                {m.live.wo ? (
+                  <span>w.o. – Sieger: {m.live.winner === "heim" ? names.heim : names.gast}</span>
+                ) : (
+                  <span>
+                    Ergebnis: {t.heimSets}:{t.gastSets} Sätze — Sieger: {m.live.winner === "heim" ? names.heim : names.gast}
+                  </span>
+                )}
+              </div>
+            ) : (
+              st === "live" && (
+                <div className="match-summary">
+                  Sätze {t.heimSets}:{t.gastSets} · Aktuell {pointLabel(m.live)}
+                </div>
+              )
+            )}
+
+            <button className="btn btn-accent btn-block" onClick={() => openMatch(def.id)}>
+              {st === "pending" ? "Spiel starten" : st === "live" ? "Weiter erfassen" : "Ergebnis ansehen"}
+            </button>
+            <div className="match-share-row">
+              <button className="btn btn-ghost btn-small" onClick={() => copyLink(def.id)}>
+                🔗 Link kopieren
+              </button>
+              <button className="btn btn-ghost btn-small" onClick={() => setQrFor((cur) => (cur === def.id ? null : def.id))}>
+                ▦ QR-Code
+              </button>
+            </div>
+            {linkFor === def.id && (
+              <div className="share-link-box">
+                <input readOnly value={shareUrl(def.id)} onFocus={(e) => e.target.select()} />
+                <p className="hint" style={{ margin: "4px 2px 0" }}>
+                  In die Zwischenablage kopiert (falls das nicht geklappt hat: Text oben markieren &amp; kopieren).
+                </p>
+              </div>
+            )}
+            {qrFor === def.id && <QRCodeBox url={shareUrl(def.id)} />}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function LiveMatchOverlay({ state, setState, matchId, close }) {
+  const def = MATCH_DEFS.find((d) => d.id === matchId);
+  const match = state.matches[matchId];
+  const names = matchPlayers(state, def);
+  const live = match.live;
+  const [showDeuce, setShowDeuce] = useState(false);
+  const [showSideChange, setShowSideChange] = useState(false);
+
+  const persist = (matchObj) => setShared(matchKey(matchId), matchObj);
+
+  const commit = (newLive, pushHistory = true) => {
+    setState((s) => {
+      const cur = s.matches[matchId];
+      const history = pushHistory ? [...cur.history, cur.live] : cur.history;
+      const next = { live: newLive, history };
+      persist(next);
+      return { ...s, matches: { ...s.matches, [matchId]: next } };
+    });
+  };
+
+  const point = (side) => {
+    const newLive = addPoint(live, side);
+    const ncs = newLive.sets[newLive.setIndex];
+
+    if (!ncs.isMTB && !ncs.inTB && newLive.points.heim === 3 && newLive.points.gast === 3) {
+      setShowDeuce(true);
+    }
+
+    // side-of-court change: after a game finishes with an odd total of games
+    // played in the set, or every 6 points during a (match-)tiebreak
+    const wasSet = newLive.sets[live.setIndex];
+    if (!newLive.winner) {
+      if (!wasSet.isMTB) {
+        const gameJustEnded = wasSet.heimGames + wasSet.gastGames !== cs.heimGames + cs.gastGames;
+        if (gameJustEnded && (wasSet.heimGames + wasSet.gastGames) % 2 === 1) {
+          setShowSideChange(true);
+          newLive.sideChangeCount = (newLive.sideChangeCount || 0) + 1;
+        }
+      }
+      if (wasSet.inTB || wasSet.isMTB) {
+        const tbSum = wasSet.tbHeim + wasSet.tbGast;
+        if (tbSum > 0 && tbSum % 6 === 0) {
+          setShowSideChange(true);
+          newLive.sideChangeCount = (newLive.sideChangeCount || 0) + 1;
+        }
+      }
+    }
+
+    commit(newLive);
+  };
+  const undo = () => {
+    if (!match.history.length) return;
+    setShowDeuce(false);
+    setShowSideChange(false);
+    const prev = match.history[match.history.length - 1];
+    const next = { live: prev, history: match.history.slice(0, -1) };
+    persist(next);
+    setState((s) => ({ ...s, matches: { ...s.matches, [matchId]: next } }));
+  };
+  const walkover = (absentSide) => commit(setWalkover(live, absentSide));
+  const resetMatch = () => commit(freshLive(), false);
+  const setServeConfig = (cfg) => commit({ ...live, serveConfig: cfg }, false);
+
+  const cs = live.sets[live.setIndex];
+  const t = matchTally(live);
+  const finished = !!live.winner;
+  const needsServeSetup = !live.serveConfig || !live.serveConfig.firstServer;
+  const serverTeam = currentServerTeam(live);
+  const heimNear = currentHeimNear(live);
+
+  return (
+    <div className={`overlay${close ? "" : " overlay-standalone"}`}>
+      <div className="overlay-inner">
+        <div className="overlay-header">
+          {close ? <button className="btn btn-ghost btn-small" onClick={close}>← Zurück</button> : <span className="kiosk-badge">▦ Live-Scoring</span>}
+          <span className="overlay-title">{def.label}</span>
+          <span style={{ width: 60 }} />
+        </div>
+
+        <div className="scoreboard">
+          <div className="scoreboard-names">
+            <span>{names.heim}</span>
+            <span className="net">┃</span>
+            <span>{names.gast}</span>
+          </div>
+
+          <div className="sets-row">
+            {live.sets.map((s, i) => (
+              <Chip key={i} tone={s.finished ? "done" : i === live.setIndex ? "live" : "default"}>
+                {s.isMTB ? "MTB " : `${i + 1}. Satz `}{setScoreStr(s)}
+              </Chip>
+            ))}
+          </div>
+
+          {!finished ? (
+            <>
+              {!cs.isMTB && (
+                <div className="games-line">
+                  Spiele: <strong>{cs.heimGames}</strong> : <strong>{cs.gastGames}</strong>
+                  {cs.inTB && <span className="tb-note"> (Tiebreak)</span>}
+                </div>
+              )}
+              <div className="points-flip">{pointLabel(live)}</div>
+              <CourtPositionIndicator live={live} serverTeam={serverTeam} heimNear={heimNear} />
+              <div className="score-buttons">
+                <button className="btn btn-big btn-heim" onClick={() => point("heim")}>+1 Heim</button>
+                <button className="btn btn-big btn-gast" onClick={() => point("gast")}>+1 Gast</button>
+              </div>
+              <div className="secondary-actions">
+                <button className="btn btn-small btn-ghost" onClick={undo} disabled={!match.history.length}>Rückgängig</button>
+              </div>
+              <div className="wo-actions">
+                <span className="wo-label">Team nicht angetreten:</span>
+                <button className="btn btn-small btn-outline" onClick={() => walkover("heim")}>Heim (w.o.)</button>
+                <button className="btn btn-small btn-outline" onClick={() => walkover("gast")}>Gast (w.o.)</button>
+              </div>
+            </>
+          ) : (
+            <div className="finished-panel">
+              <div className="winner-banner">
+                🏆 Sieger: {live.winner === "heim" ? names.heim : names.gast}
+              </div>
+              {!live.wo && (
+                <div className="games-line">Sätze {t.heimSets}:{t.gastSets} · Spiele {t.heimGames}:{t.gastGames}</div>
+              )}
+              <button className="btn btn-small btn-ghost" onClick={resetMatch}>Spiel zurücksetzen</button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {showDeuce && (
+        <div className="deuce-backdrop">
+          <div className="deuce-modal">
+            <div className="deuce-title">40 : 40 – No-Ad</div>
+            <p className="deuce-text">
+              Der <strong>Rückschläger</strong> darf sich jetzt aussuchen, von welcher Seite (Vorteil- oder Rückhandseite)
+              der Aufschläger den nächsten Ball aufschlägt. Dieser Punkt entscheidet das Spiel – es gibt keinen Vorteil.
+            </p>
+            <button className="btn btn-accent btn-block" onClick={() => setShowDeuce(false)}>OK</button>
+          </div>
+        </div>
+      )}
+
+      {showSideChange && (
+        <div className="deuce-backdrop">
+          <div className="deuce-modal">
+            <div className="deuce-title">🔄 Seitenwechsel</div>
+            <p className="deuce-text">
+              Wie im Tennis üblich: Die Spieler wechseln jetzt die Feldseite, bevor es weitergeht.
+            </p>
+            <button className="btn btn-accent btn-block" onClick={() => setShowSideChange(false)}>OK</button>
+          </div>
+        </div>
+      )}
+
+      {needsServeSetup && !finished && (
+        <ServeSetupModal names={names} onConfirm={setServeConfig} />
+      )}
+    </div>
+  );
+}
+
+/* ---------- Report Screen ---------- */
+
+function ReportScreen({ state }) {
+  const tennisTotals = { heim: 0, gast: 0 };
+  const rows = MATCH_DEFS.map((def) => {
+    const m = state.matches[def.id];
+    const names = matchPlayers(state, def);
+    const t = matchTally(m.live);
+    const live = m.live;
+    const done = !!live.winner;
+    const mpHeim = done ? (live.winner === "heim" ? 2 : 0) : "";
+    const mpGast = done ? (live.winner === "gast" ? 2 : 0) : "";
+    if (done) {
+      tennisTotals.heim += mpHeim;
+      tennisTotals.gast += mpGast;
+    }
+    return { def, names, t, live, done, mpHeim, mpGast };
+  });
+
+  const einzelRows = rows.filter((r) => r.def.type === "einzel");
+  const doppelRows = rows.filter((r) => r.def.type === "doppel");
+
+  const motorikPoints = { heim: 0, gast: 0 };
+  const motorikRows = EX_DEFS.map((ex) => {
+    const v = state.motorik[ex.key];
+    const winner = computeExWinner(ex, v);
+    if (winner === "heim") motorikPoints.heim += 2;
+    else if (winner === "gast") motorikPoints.gast += 2;
+    else if (winner === "draw") { motorikPoints.heim += 1; motorikPoints.gast += 1; }
+    return { ...ex, value: v, winner };
+  });
+
+  const totalHeim = tennisTotals.heim + motorikPoints.heim;
+  const totalGast = tennisTotals.gast + motorikPoints.gast;
+  const allDone = rows.every((r) => r.done) && motorikRows.every((r) => r.winner);
+
+  let verdict = null;
+  if (allDone) {
+    if (totalHeim === totalGast) verdict = "Unentschieden";
+    else verdict = `Sieger: ${totalHeim > totalGast ? state.meta.heimName || "Heim" : state.meta.gastName || "Gast"}`;
+  }
+
+  const renderSetCols = (r) => {
+    const cols = [0, 1, 2].map((i) => {
+      const s = r.live.sets[i];
+      if (!s) return <td key={i}>–</td>;
+      return <td key={i}>{setScoreStr(s)}</td>;
+    });
+    return cols;
+  };
+
+  return (
+    <div className="screen">
+      <h2 className="screen-title">Spielbericht</h2>
+
+      <div className="card report-head">
+        <div>{state.meta.liga || "Liga / Gruppe"}</div>
+        <div className="report-nr">Spielbericht {state.meta.berichtNr && `Nr. ${state.meta.berichtNr}`} {state.meta.termin && `– ${new Date(state.meta.termin).toLocaleString("de-DE")}`}</div>
+        <div className="report-teams">
+          <strong>{state.meta.heimName || "Heimverein"}</strong> : <strong>{state.meta.gastName || "Gastverein"}</strong>
+        </div>
+      </div>
+
+      <div className="card table-card">
+        <div className="table-title">Einzel</div>
+        <table>
+          <thead>
+            <tr><th>Spieler</th><th>1.S</th><th>2.S</th><th>3.S</th><th>MP</th></tr>
+          </thead>
+          <tbody>
+            {einzelRows.map((r) => (
+              <React.Fragment key={r.def.id}>
+                <tr>
+                  <td>{r.names.heim}</td>
+                  {renderSetCols(r)}
+                  <td>{r.mpHeim}</td>
+                </tr>
+                <tr className="row-gast">
+                  <td>{r.names.gast}</td>
+                  <td colSpan={3}></td>
+                  <td>{r.mpGast}</td>
+                </tr>
+              </React.Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card table-card">
+        <div className="table-title">Doppel</div>
+        <table>
+          <thead>
+            <tr><th>Paarung</th><th>1.S</th><th>2.S</th><th>3.S</th><th>MP</th></tr>
+          </thead>
+          <tbody>
+            {doppelRows.map((r) => (
+              <React.Fragment key={r.def.id}>
+                <tr>
+                  <td>{r.names.heim}</td>
+                  {renderSetCols(r)}
+                  <td>{r.mpHeim}</td>
+                </tr>
+                <tr className="row-gast">
+                  <td>{r.names.gast}</td>
+                  <td colSpan={3}></td>
+                  <td>{r.mpGast}</td>
+                </tr>
+              </React.Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card table-card">
+        <div className="table-title">Motorik</div>
+        <table>
+          <thead><tr><th>Übung</th><th>Heim</th><th>Gast</th><th>Punkte</th></tr></thead>
+          <tbody>
+            {motorikRows.map((r) => (
+              <tr key={r.key}>
+                <td>{r.key}. {r.name}</td>
+                <td>{r.value.heim || "–"}{r.value.heim ? ` ${r.unit}` : ""}</td>
+                <td>{r.value.gast || "–"}{r.value.gast ? ` ${r.unit}` : ""}</td>
+                <td>
+                  {r.winner === "heim" && "2:0"}
+                  {r.winner === "gast" && "0:2"}
+                  {r.winner === "draw" && "1:1"}
+                  {!r.winner && "–"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card total-card">
+        <div className="total-row"><span>Tennis-Punkte (max. 12)</span><span className="total-score">{tennisTotals.heim} : {tennisTotals.gast}</span></div>
+        <div className="total-row"><span>Motorik-Punkte (max. 6)</span><span className="total-score">{motorikPoints.heim} : {motorikPoints.gast}</span></div>
+        <div className="total-row total-final"><span>Gesamtergebnis</span><span className="total-score">{totalHeim} : {totalGast}</span></div>
+        {verdict && <div className="verdict">{verdict}</div>}
+        {!allDone && <div className="hint">Noch nicht alle Spiele bzw. Motorikübungen abgeschlossen.</div>}
+      </div>
+
+      <button className="btn btn-accent btn-block" onClick={() => window.print()}>Bericht drucken / als PDF speichern</button>
+      <p className="hint">Zur offiziellen Eingabe im BTV-Portal die Werte aus diesem Bericht 1:1 übertragen.</p>
+    </div>
+  );
+}
+
+/* ---------- Live Screen (public, read-only overview for parents/coaches) ---------- */
+
+function currentPointVal(live, side) {
+  const cs = live.sets[live.setIndex];
+  if (cs.isMTB || cs.inTB) return String(side === "heim" ? cs.tbHeim : cs.tbGast);
+  return PT_LABEL[live.points[side]];
+}
+
+function BroadcastRow({ name, isServer, sets, currentSetIndex, pointVal, isWinner, side, finished }) {
+  return (
+    <div className={`bc-row bc-row-${side}${isWinner ? " bc-row-winner" : ""}`}>
+      <span className={`bc-accent bc-accent-${side}`} />
+      <span className="bc-serve">{isServer && !finished ? "●" : ""}</span>
+      <span className="bc-name">{name}</span>
+      <span className="bc-sets">
+        {sets.map((v, i) => (
+          <span key={i} className={`bc-set-cell${i === currentSetIndex && !finished ? " bc-set-cell-active" : ""}`}>
+            {v}
+          </span>
+        ))}
+      </span>
+      {!finished && <span className="bc-point">{pointVal}</span>}
+      {isWinner && <span className="bc-trophy">🏆</span>}
+    </div>
+  );
+}
+
+function LiveScreen({ state, openMatch }) {
+  const tennisTotals = { heim: 0, gast: 0 };
+  MATCH_DEFS.forEach((def) => {
+    const w = state.matches[def.id].live.winner;
+    if (w === "heim") tennisTotals.heim += 2;
+    else if (w === "gast") tennisTotals.gast += 2;
+  });
+  const motorikPoints = { heim: 0, gast: 0 };
+  EX_DEFS.forEach((ex) => {
+    const w = computeExWinner(ex, state.motorik[ex.key]);
+    if (w === "heim") motorikPoints.heim += 2;
+    else if (w === "gast") motorikPoints.gast += 2;
+    else if (w === "draw") { motorikPoints.heim += 1; motorikPoints.gast += 1; }
+  });
+
+  return (
+    <div className="screen broadcast-screen">
+      <h2 className="screen-title bc-title">📺 Live-Übersicht</h2>
+      <p className="hint bc-subhint">
+        Nur Zuschauen — bearbeitet wird im Tab „Spiele“. Aktualisiert sich automatisch.
+      </p>
+
+      {MATCH_DEFS.map((def) => {
+        const m = state.matches[def.id];
+        const names = matchPlayers(state, def);
+        const st = statusOf(m.live);
+        const live = m.live;
+        const finished = !!live.winner;
+        const serverTeam = finished ? null : currentServerTeam(live);
+        const heimSets = live.sets.map((s) => (s.isMTB ? s.tbHeim : s.heimGames));
+        const gastSets = live.sets.map((s) => (s.isMTB ? s.tbGast : s.gastGames));
+
+        return (
+          <div className="bc-card" key={def.id}>
+            <div className="bc-card-head">
+              <span className="bc-match-label">{def.label}</span>
+              {st === "live" && <span className="bc-live-tag"><span className="bc-live-dot" /> LIVE</span>}
+              {st === "done" && <span className="bc-done-tag">BEENDET</span>}
+              {st === "pending" && <span className="bc-pending-tag">WARTET</span>}
+            </div>
+
+            {m.live.wo ? (
+              <div className="bc-wo">w.o. — Sieger: {live.winner === "heim" ? names.heim : names.gast}</div>
+            ) : (
+              <div className="bc-rows">
+                <BroadcastRow
+                  side="heim"
+                  name={names.heim}
+                  isServer={serverTeam === "heim"}
+                  sets={heimSets}
+                  currentSetIndex={live.setIndex}
+                  pointVal={currentPointVal(live, "heim")}
+                  isWinner={live.winner === "heim"}
+                  finished={finished}
+                />
+                <BroadcastRow
+                  side="gast"
+                  name={names.gast}
+                  isServer={serverTeam === "gast"}
+                  sets={gastSets}
+                  currentSetIndex={live.setIndex}
+                  pointVal={currentPointVal(live, "gast")}
+                  isWinner={live.winner === "gast"}
+                  finished={finished}
+                />
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      <div className="card total-card">
+        <div className="total-row"><span>Tennis-Punkte</span><span className="total-score">{tennisTotals.heim} : {tennisTotals.gast}</span></div>
+        <div className="total-row"><span>Motorik-Punkte</span><span className="total-score">{motorikPoints.heim} : {motorikPoints.gast}</span></div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Admin password gate ---------- */
+
+function AdminGate({ onUnlock }) {
+  const [pw, setPw] = useState("");
+  const [error, setError] = useState(false);
+
+  const submit = () => {
+    if (pw === ADMIN_PASSWORD) { setError(false); onUnlock(); }
+    else setError(true);
+  };
+
+  return (
+    <div className="screen">
+      <h2 className="screen-title">Admin-Bereich</h2>
+      <div className="card">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Setup, Motorik und Bericht sind für die Turnierleitung reserviert. Eltern und Trainer punkten live über die Tabs „Live“ und „Spiele“ – dafür ist kein Passwort nötig.
+        </p>
+        <div className="field-row">
+          <label>Admin-Passwort</label>
+          <input
+            type="password"
+            value={pw}
+            onChange={(e) => { setPw(e.target.value); setError(false); }}
+            onKeyDown={(e) => e.key === "Enter" && submit()}
+            placeholder="••••"
+          />
+        </div>
+        {error && <p className="hint" style={{ color: "var(--warn)", marginTop: -4 }}>Falsches Passwort.</p>}
+        <button className="btn btn-accent btn-block" onClick={submit}>Freischalten</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- App shell ---------- */
+
+function App() {
+  const [state, setState] = useState(defaultState());
+  const [screen, setScreen] = useState("live");
+  const [activeMatch, setActiveMatch] = useState(null);
+  const [kioskMatch, setKioskMatch] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(loadAdminAuth());
+
+  const ADMIN_SCREENS = ["setup", "motorik", "report"];
+
+  // live sync: subscribe once to every shared slice + every match. Firebase
+  // fires the callback immediately with the current value and again every
+  // time ANY device changes that path — no polling needed, and every
+  // screen (Live, Spiele, ...) always reflects what everyone else is doing.
+  useEffect(() => {
+    const base = defaultState();
+    const unsubs = [];
+
+    unsubs.push(subscribeShared(SHARED_KEYS.meta, (v) => {
+      setState((s) => ({ ...s, meta: { ...base.meta, ...(v || {}) } }));
+    }));
+    unsubs.push(subscribeShared(SHARED_KEYS.players, (v) => {
+      setState((s) => ({
+        ...s,
+        players: {
+          heim: Array.isArray(v && v.heim) && v.heim.length ? v.heim : base.players.heim,
+          gast: Array.isArray(v && v.gast) && v.gast.length ? v.gast : base.players.gast,
+        },
+      }));
+    }));
+    unsubs.push(subscribeShared(SHARED_KEYS.clubs, (v) => {
+      setState((s) => ({ ...s, clubs: Array.isArray(v) ? v : base.clubs }));
+    }));
+    unsubs.push(subscribeShared(SHARED_KEYS.motorik, (v) => {
+      const motorik = {};
+      EX_DEFS.forEach((ex) => {
+        const m = (v && v[ex.key]) || {};
+        motorik[ex.key] = { heim: m.heim ?? "", gast: m.gast ?? "", manualWinner: m.manualWinner ?? null };
+      });
+      setState((s) => ({ ...s, motorik }));
+    }));
+    unsubs.push(subscribeShared(SHARED_KEYS.doubles, (v) => {
+      setState((s) => ({ ...s, doubles: { ...base.doubles, ...(v || {}) } }));
+    }));
+    MATCH_DEFS.forEach((d) => {
+      unsubs.push(subscribeShared(matchKey(d.id), (v) => {
+        setState((s) => ({
+          ...s,
+          matches: { ...s.matches, [d.id]: v ? { ...v, live: normalizeLive(v.live) } : base.matches[d.id] },
+        }));
+      }));
+    });
+
+    setLoaded(true);
+
+    const hash = window.location.hash || "";
+    const m = hash.match(/match=([a-z0-9]+)/i);
+    if (m && MATCH_DEFS.some((d) => d.id === m[1])) {
+      setKioskMatch(m[1]);
+    }
+
+    return () => unsubs.forEach((u) => u());
+  }, []);
+
+  // debounced save for the non-match slices (meta/players/clubs/motorik/doubles)
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => {
+      setShared(SHARED_KEYS.meta, state.meta);
+      setShared(SHARED_KEYS.players, state.players);
+      setShared(SHARED_KEYS.clubs, state.clubs);
+      setShared(SHARED_KEYS.motorik, state.motorik);
+      setShared(SHARED_KEYS.doubles, state.doubles);
+    }, 400);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.meta, state.players, state.clubs, state.motorik, state.doubles, loaded]);
+
+  const openMatch = (id) => setActiveMatch(id);
+
+  const unlockAdmin = () => { setIsAdmin(true); setAdminAuth(true); };
+  const lockAdmin = () => { setIsAdmin(false); setAdminAuth(false); };
+
+  const tabs = [
+    { key: "live", label: "Live" },
+    { key: "matches", label: "Spiele" },
+    { key: "setup", label: "Setup", admin: true },
+    { key: "motorik", label: "Motorik", admin: true },
+    { key: "report", label: "Bericht", admin: true },
+  ];
+
+  return (
+    <div className="app-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+        :root{
+          --btv-green:#0E6B3E;
+          --btv-green-dark:#0A4A2B;
+          --btv-green-light:#E4F1EA;
+          --btv-blue:#0072BC;
+          --btv-blue-dark:#00548C;
+          --btv-blue-light:#E3F1FA;
+          --paper:#F4F7F5;
+          --surface:#FFFFFF;
+          --line:#DCE5E0;
+          --ink:#132A20;
+          --slate:#5E7267;
+          --warn:#C1272D;
+        }
+        *{box-sizing:border-box;}
+        .app-root{
+          font-family:'Inter',sans-serif;
+          background:var(--paper);
+          color:var(--ink);
+          min-height:100vh;
+          padding-bottom:76px;
+        }
+        .screen{ padding:16px 14px 8px; max-width:520px; margin:0 auto; }
+        .screen-title{
+          font-family:'Oswald',sans-serif;
+          font-weight:600;
+          letter-spacing:0.04em;
+          text-transform:uppercase;
+          font-size:1.3rem;
+          margin:6px 0 14px;
+          color:var(--btv-green-dark);
+          border-left:4px solid var(--btv-green);
+          padding-left:10px;
+        }
+        .card{
+          background:var(--surface);
+          border:1px solid var(--line);
+          border-radius:12px;
+          padding:14px;
+          margin-bottom:12px;
+          box-shadow:0 1px 2px rgba(10,74,43,0.05);
+        }
+        .card-head{ display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+        .field-row{ display:flex; flex-direction:column; gap:4px; margin-bottom:10px; }
+        .field-row label{ font-size:0.75rem; color:var(--slate); text-transform:uppercase; letter-spacing:0.04em; }
+        input, select{
+          background:var(--paper);
+          border:1px solid var(--line);
+          color:var(--ink);
+          border-radius:6px;
+          padding:9px 10px;
+          font-size:0.95rem;
+          font-family:'Inter',sans-serif;
+          width:100%;
+        }
+        input:focus, select:focus, textarea:focus{ outline:2px solid var(--btv-blue); outline-offset:1px; }
+        textarea{
+          background:var(--paper);
+          border:1px solid var(--line);
+          color:var(--ink);
+          border-radius:6px;
+          padding:9px 10px;
+          font-size:0.85rem;
+          font-family:'Inter',sans-serif;
+          width:100%;
+          resize:vertical;
+        }
+        .paste-area{ margin-bottom:8px; }
+        .import-panel{ margin-top:12px; padding-top:12px; border-top:1px dashed var(--line); }
+        .inline-add{ display:flex; gap:6px; }
+        .inline-add input{ flex:1; }
+        .link{ color:var(--btv-blue); text-decoration:underline; }
+        .club-chip-list{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+        .team-name-input{ flex:1; font-weight:600; }
+        .side-tag{
+          font-family:'Oswald',sans-serif;
+          font-size:0.75rem;
+          text-transform:uppercase;
+          letter-spacing:0.06em;
+          padding:3px 10px;
+          border-radius:20px;
+          white-space:nowrap;
+        }
+        .side-heim{ background:var(--btv-green); color:#fff; }
+        .side-gast{ background:var(--btv-blue); color:#fff; }
+        .players-list{ display:flex; flex-direction:column; gap:6px; }
+        .player-row{ display:flex; align-items:center; gap:8px; }
+        .player-move-btns{ display:flex; flex-direction:column; gap:2px; flex-shrink:0; }
+        .player-move-btn{ padding:2px 8px; line-height:1; font-size:0.85rem; }
+        .player-pos{
+          font-family:'Oswald',sans-serif;
+          background:var(--btv-green-light);
+          color:var(--btv-green-dark);
+          border-radius:50%;
+          width:26px;height:26px;
+          display:flex;align-items:center;justify-content:center;
+          font-size:0.85rem; flex-shrink:0;
+        }
+        .player-actions{ display:flex; gap:8px; margin-top:10px; }
+        .hint{ color:var(--slate); font-size:0.82rem; line-height:1.4; margin:10px 2px; }
+
+        .btn{
+          border:none; border-radius:8px; cursor:pointer;
+          font-family:'Inter',sans-serif; font-weight:600;
+          transition:transform 0.05s ease;
+        }
+        .btn:active{ transform:scale(0.97); }
+        .btn:disabled{ opacity:0.4; cursor:not-allowed; }
+        .btn-block{ width:100%; padding:12px; font-size:0.95rem; }
+        .btn-small{ padding:7px 12px; font-size:0.8rem; }
+        .btn-big{ padding:18px 10px; font-size:1.05rem; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:0.03em; }
+        .btn-accent{ background:var(--btv-green); color:#fff; }
+        .btn-ghost{ background:transparent; color:var(--ink); border:1px solid var(--line); }
+        .btn-outline{ background:transparent; color:var(--btv-blue); border:1px solid var(--btv-blue); }
+        .btn-stop{ background:var(--btv-blue); color:#fff; }
+        .btn-heim{ background:var(--btv-green); color:#fff; }
+        .btn-gast{ background:var(--btv-blue); color:#fff; }
+
+        .ex-badge{
+          font-family:'Oswald',sans-serif; font-weight:700; font-size:1.3rem;
+          background:var(--btv-green-dark); color:#fff;
+          width:38px;height:38px;border-radius:50%;
+          display:flex;align-items:center;justify-content:center;flex-shrink:0;
+        }
+        .ex-name{ font-weight:700; }
+        .ex-desc{ font-size:0.78rem; color:var(--slate); margin-top:2px; }
+        .motorik-grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+        .motorik-col{ display:flex; flex-direction:column; gap:8px; align-items:flex-start; }
+        .stopwatch{ display:flex; flex-direction:column; gap:6px; width:100%; }
+        .stopwatch-time{ font-family:'Oswald',sans-serif; font-size:1.6rem; color:var(--btv-green-dark); }
+        .stopwatch-btns{ display:flex; gap:6px; }
+        .stopwatch-saved{ font-size:0.75rem; color:var(--btv-green); }
+        .distance-input{ display:flex; align-items:center; gap:6px; width:100%; }
+        .distance-input .unit{ color:var(--slate); font-size:0.85rem; }
+        .ex-result{
+          margin-top:10px; padding:8px 10px; border-radius:6px;
+          background:var(--btv-green-light); color:var(--btv-green-dark);
+          font-size:0.85rem; font-weight:600;
+        }
+        .ex-manual-row{ margin-top:12px; padding-top:10px; border-top:1px dashed var(--line); }
+        .ex-manual-label{ font-size:0.75rem; color:var(--slate); text-transform:uppercase; letter-spacing:0.03em; display:block; margin-bottom:6px; }
+        .ex-manual-btns{ display:flex; gap:6px; flex-wrap:wrap; }
+        .ex-manual-tag{ color:var(--slate); font-weight:400; font-style:italic; }
+
+        /* ---- Live tab: TV-broadcast style scoreboard ---- */
+        .broadcast-screen{ background:#0B1712; margin:0 -14px; padding:16px 14px 8px; border-radius:0; }
+        .bc-title{ color:#fff; border-left-color:#E10600; }
+        .bc-subhint{ color:#7C9483; margin-top:-6px; }
+        .bc-card{
+          background:#12241C; border:1px solid #1E3A2C; border-radius:8px;
+          margin-bottom:12px; overflow:hidden;
+        }
+        .bc-card-head{
+          display:flex; justify-content:space-between; align-items:center;
+          padding:6px 10px; background:#0E1E17; font-family:'Oswald',sans-serif;
+          font-size:0.78rem; letter-spacing:0.04em; text-transform:uppercase; color:#9FB3A8;
+        }
+        .bc-live-tag{ color:#fff; background:#E10600; padding:2px 8px; border-radius:3px; display:flex; align-items:center; gap:5px; font-weight:700; }
+        .bc-live-dot{ width:7px; height:7px; border-radius:50%; background:#fff; animation:bcPulse 1.1s ease-in-out infinite; }
+        @keyframes bcPulse{ 0%,100%{ opacity:1; } 50%{ opacity:0.25; } }
+        .bc-done-tag{ color:#0B1712; background:#D7DE4A; padding:2px 8px; border-radius:3px; font-weight:700; }
+        .bc-pending-tag{ color:#9FB3A8; background:rgba(255,255,255,0.08); padding:2px 8px; border-radius:3px; font-weight:700; }
+        .bc-wo{ padding:14px; color:#D7DE4A; font-size:0.9rem; text-align:center; }
+        .bc-rows{ display:flex; flex-direction:column; }
+        .bc-row{
+          display:flex; align-items:center; gap:10px; padding:9px 10px;
+          border-top:1px solid rgba(255,255,255,0.05);
+        }
+        .bc-row:first-child{ border-top:none; }
+        .bc-accent{ width:4px; align-self:stretch; border-radius:2px; flex-shrink:0; }
+        .bc-accent-heim{ background:#1CBB6E; }
+        .bc-accent-gast{ background:#2DA1F0; }
+        .bc-serve{ width:10px; color:#E10600; font-size:0.7rem; flex-shrink:0; }
+        .bc-name{
+          flex:1; color:#fff; font-family:'Inter',sans-serif; font-weight:600; font-size:0.92rem;
+          overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+        }
+        .bc-row-winner .bc-name{ color:#D7DE4A; }
+        .bc-sets{ display:flex; gap:4px; flex-shrink:0; }
+        .bc-set-cell{
+          width:22px; height:26px; display:flex; align-items:center; justify-content:center;
+          font-family:'Oswald',sans-serif; font-size:0.85rem; color:#9FB3A8;
+          background:rgba(255,255,255,0.05); border-radius:4px;
+        }
+        .bc-set-cell-active{ background:#1E3A2C; color:#fff; font-weight:700; }
+        .bc-point{
+          min-width:34px; text-align:center; font-family:'Oswald',sans-serif; font-weight:700; font-size:1.15rem;
+          color:#fff; background:#1E3A2C; border-radius:4px; padding:3px 6px; flex-shrink:0;
+        }
+        .bc-trophy{ font-size:1rem; flex-shrink:0; }
+        .broadcast-screen .total-card{ background:#12241C; border-color:#1E3A2C; }
+        .broadcast-screen .total-card *{ color:#fff; }
+
+        .total-card{ background:var(--btv-green-dark); border-color:var(--btv-green-dark); }
+        .total-card, .total-card *{ color:#fff; }
+        .total-row{ display:flex; justify-content:space-between; align-items:center; padding:5px 0; }
+        .total-final{ border-top:1px solid rgba(255,255,255,0.25); margin-top:4px; padding-top:10px; font-weight:700; }
+        .total-score{ font-family:'Oswald',sans-serif; font-size:1.2rem; }
+        .verdict{ margin-top:8px; text-align:center; font-family:'Oswald',sans-serif; font-size:1rem; color:#fff; text-transform:uppercase; letter-spacing:0.03em; }
+
+        .chip{ display:inline-block; padding:3px 9px; border-radius:20px; font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.03em; }
+        .chip-default{ background:var(--btv-green-light); color:var(--btv-green-dark); }
+        .chip-live{ background:var(--btv-blue-light); color:var(--btv-blue-dark); }
+        .chip-done{ background:var(--btv-green); color:#fff; }
+        .chip-pending{ background:var(--paper); color:var(--slate); border:1px solid var(--line); }
+
+        .screen-title-row{ display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:14px; }
+        .screen-title-row .screen-title{ margin-bottom:0; }
+        .live-score-row{ display:flex; justify-content:space-between; align-items:center; font-size:0.85rem; color:var(--btv-blue-dark); margin-bottom:4px; }
+        .live-points{ font-family:'Oswald',sans-serif; font-weight:700; font-size:1.1rem; color:var(--btv-green-dark); }
+        .match-card-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+        .match-label{ font-family:'Oswald',sans-serif; letter-spacing:0.03em; color:var(--btv-green-dark); }
+        .doubles-select{ display:flex; gap:14px; margin-bottom:10px; flex-wrap:wrap; }
+        .doubles-side{ display:flex; flex-direction:column; gap:6px; flex:1; min-width:130px; }
+        .match-names{ display:flex; align-items:center; gap:8px; font-size:0.9rem; margin-bottom:8px; flex-wrap:wrap; }
+        .match-names .vs{ color:var(--slate); font-size:0.75rem; }
+        .match-summary{ font-size:0.82rem; color:var(--btv-blue-dark); margin-bottom:10px; }
+        .share-link-box{ margin-top:8px; }
+        .share-link-box input{ font-size:0.75rem; }
+        .match-share-row{ display:flex; gap:8px; margin-top:8px; }
+        .match-share-row .btn{ flex:1; }
+        .qr-box{ margin-top:12px; display:flex; flex-direction:column; align-items:center; text-align:center; }
+        .qr-canvas-wrap{ background:#fff; padding:10px; border-radius:8px; border:1px solid var(--line); display:inline-block; }
+        .qr-hint{ max-width:220px; margin:8px auto 0; }
+        .danger-card{ border-color:var(--warn); }
+        .danger-btn{ background:var(--warn); color:#fff; }
+
+        .overlay{
+          position:fixed; inset:0; background:rgba(10,32,20,0.55); z-index:50;
+          display:flex; align-items:flex-start; justify-content:center; overflow-y:auto;
+        }
+        .overlay-inner{ width:100%; max-width:520px; padding:14px; }
+        .overlay-header{ display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+        .overlay-title{ font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:0.05em; color:#fff; }
+        .overlay-header .btn-ghost{ background:rgba(255,255,255,0.9); }
+        .kiosk-badge{ font-size:0.72rem; color:#fff; background:rgba(255,255,255,0.15); padding:4px 10px; border-radius:20px; }
+        .scoreboard{ background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:18px 14px; text-align:center; box-shadow:0 4px 16px rgba(10,32,20,0.15); }
+        .scoreboard-names{ display:flex; justify-content:space-between; align-items:center; font-weight:700; margin-bottom:10px; gap:8px; color:var(--ink); }
+        .scoreboard-names .net{ color:var(--slate); }
+        .sets-row{ display:flex; gap:6px; justify-content:center; flex-wrap:wrap; margin-bottom:14px; }
+        .games-line{ font-size:0.95rem; margin-bottom:6px; color:var(--ink); }
+        .tb-note{ color:var(--btv-blue); font-size:0.8rem; }
+        .points-flip{
+          font-family:'Oswald',sans-serif; font-weight:700; font-size:3rem;
+          background:var(--btv-green-dark); color:#fff; border-radius:10px; padding:10px 0; margin:10px 0 18px;
+          letter-spacing:0.02em;
+        }
+        .score-buttons{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:14px; }
+        .court-indicator{ margin:0 0 14px; }
+        .court-svg{ width:100%; height:auto; max-height:140px; display:block; border-radius:8px; }
+        .court-caption{ display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; font-size:0.72rem; color:var(--slate); margin-top:6px; }
+        .court-legend{ display:flex; align-items:center; gap:5px; }
+        .court-dot-legend{ width:10px; height:10px; border-radius:50%; display:inline-block; flex-shrink:0; }
+        .court-flip-row{ display:flex; gap:8px; margin-top:8px; }
+        .court-flip-row .btn{ flex:1; }
+        .secondary-actions{ margin-bottom:14px; }
+        .wo-actions{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:center; font-size:0.78rem; color:var(--slate); }
+        .wo-label{ width:100%; }
+        .finished-panel{ padding:10px 0; }
+        .winner-banner{ font-family:'Oswald',sans-serif; font-size:1.2rem; margin-bottom:10px; color:var(--btv-green-dark); }
+        .deuce-backdrop{
+          position:fixed; inset:0; background:rgba(10,32,20,0.6); z-index:60;
+          display:flex; align-items:center; justify-content:center; padding:20px;
+        }
+        .deuce-modal{
+          background:var(--surface); border-radius:14px; padding:20px 18px; max-width:360px; width:100%;
+          box-shadow:0 8px 28px rgba(10,32,20,0.3); text-align:center;
+        }
+        .deuce-title{ font-family:'Oswald',sans-serif; font-weight:700; font-size:1.15rem; color:var(--btv-green-dark); margin-bottom:10px; letter-spacing:0.02em; }
+        .deuce-text{ font-size:0.88rem; line-height:1.5; color:var(--ink); margin-bottom:16px; }
+        .serve-setup-btns{ display:flex; flex-direction:column; gap:8px; }
+
+        .report-head{ text-align:center; }
+        .report-nr{ font-size:0.8rem; color:var(--slate); margin:4px 0; }
+        .report-teams{ font-size:1.05rem; margin-top:6px; color:var(--btv-green-dark); }
+        .table-card table{ width:100%; border-collapse:collapse; font-size:0.85rem; }
+        .table-title{ font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:8px; color:var(--btv-green-dark); }
+        .table-card th, .table-card td{ border-bottom:1px solid var(--line); padding:6px 4px; text-align:left; }
+        .table-card th{ color:var(--slate); font-weight:500; font-size:0.72rem; text-transform:uppercase; }
+        .row-gast td{ color:var(--ink); opacity:0.75; }
+
+        .navbar{
+          position:fixed; bottom:0; left:0; right:0;
+          display:flex; background:var(--surface);
+          border-top:1px solid var(--line);
+          box-shadow:0 -2px 8px rgba(10,32,20,0.06);
+          z-index:40;
+        }
+        .navbar button{
+          flex:1; background:none; border:none; color:var(--slate);
+          padding:12px 4px; font-family:'Oswald',sans-serif; font-size:0.78rem;
+          text-transform:uppercase; letter-spacing:0.04em; cursor:pointer;
+        }
+        .navbar button.active{ color:var(--btv-green); border-top:2px solid var(--btv-green); }
+
+        @media print{
+          .navbar, .btn-block{ display:none !important; }
+          .app-root{ background:white; color:black; }
+          .card{ background:white; border:1px solid #999; color:black; box-shadow:none; }
+          .table-card th, .table-card td{ color:black; border-color:#ccc; }
+          .table-title, .report-nr{ color:black; }
+        }
+      `}</style>
+
+      {kioskMatch ? (
+        <LiveMatchOverlay state={state} setState={setState} matchId={kioskMatch} close={null} />
+      ) : (
+        <>
+          {screen === "live" && <LiveScreen state={state} openMatch={openMatch} />}
+          {screen === "matches" && <MatchesScreen state={state} setState={setState} openMatch={openMatch} />}
+          {screen === "setup" && (isAdmin ? <SetupScreen state={state} setState={setState} onLockAdmin={lockAdmin} /> : <AdminGate onUnlock={unlockAdmin} />)}
+          {screen === "motorik" && (isAdmin ? <MotorikScreen state={state} setState={setState} /> : <AdminGate onUnlock={unlockAdmin} />)}
+          {screen === "report" && (isAdmin ? <ReportScreen state={state} /> : <AdminGate onUnlock={unlockAdmin} />)}
+
+          {activeMatch && (
+            <LiveMatchOverlay state={state} setState={setState} matchId={activeMatch} close={() => setActiveMatch(null)} />
+          )}
+
+          <nav className="navbar">
+            {tabs.map((t) => (
+              <button key={t.key} className={screen === t.key ? "active" : ""} onClick={() => setScreen(t.key)}>
+                {t.label}{t.admin && !isAdmin ? " 🔒" : ""}
+              </button>
+            ))}
+          </nav>
+        </>
+      )}
+    </div>
+  );
+}
+
+const rootEl = document.getElementById("root");
+ReactDOM.createRoot(rootEl).render(<App />);
+</script>
+
+<!-- Manually transform the app source above with Babel, forcing the
+     "classic" JSX runtime (React.createElement calls). The newer automatic
+     runtime that Babel's react preset uses by default emits an
+     `import ... from "react/jsx-runtime"` statement, which breaks when run
+     as a plain (non-module) script — that was the "Cannot use import
+     statement outside a module" error. -->
+<script>
+  const src = document.getElementById("app-source").textContent;
+  const { code } = Babel.transform(src, { presets: [["react", { runtime: "classic" }]] });
+  const runnable = document.createElement("script");
+  runnable.textContent = code;
+  document.body.appendChild(runnable);
+</script>
+</body>
+</html>
