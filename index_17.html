@@ -1,0 +1,2787 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>U9 Kleinfeld Live-Tracker</title>
+
+<!-- React -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<!-- Babel Standalone: transforms the JSX below directly in the browser, no build step needed -->
+<script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+
+<!-- Firebase (compat SDK — simplest to use without a bundler) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+
+<!-- QR code generation (client-side, renders into a div, no external service) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+<style>
+  html, body { margin:0; padding:0; }
+  #root { min-height:100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // ============================================================
+  // 1) FIREBASE SETUP — filled in with your project's config.
+  //    (apiKey is safe to expose client-side for Firebase; access control
+  //    happens via the Realtime Database Security Rules, not by hiding it.)
+  // ============================================================
+  const firebaseConfig = {
+    apiKey: "AIzaSyDXdNNL0oTD9b-1V-gmu581uCEOGun_p7E",
+    authDomain: "tennis-app-41d31.firebaseapp.com",
+    databaseURL: "https://tennis-app-41d31-default-rtdb.europe-west1.firebasedatabase.app",
+    projectId: "tennis-app-41d31",
+    storageBucket: "tennis-app-41d31.firebasestorage.app",
+    messagingSenderId: "48171140394",
+    appId: "1:48171140394:web:00945a4dd93aad21e40a53",
+    measurementId: "G-X1X6PXN522"
+  };
+
+  // Defensive check: if this shows up, the Firebase/React CDN scripts above
+  // didn't load. Almost always this means the page was opened inside a
+  // sandboxed preview (e.g. an in-chat "preview" panel) that blocks
+  // external network requests — this page MUST be opened as a real
+  // webpage: either double-click index.html locally, or host it (GitHub
+  // Pages etc.). It will NOT work inside Claude's own artifact/file preview.
+  if (typeof firebase === "undefined") {
+    document.getElementById("root").innerHTML =
+      '<div style="font-family:sans-serif;max-width:480px;margin:60px auto;padding:20px;' +
+      'border:2px solid #C1272D;border-radius:10px;color:#132A20;line-height:1.5;">' +
+      '<strong>Firebase konnte nicht geladen werden.</strong><br><br>' +
+      'Diese Seite braucht echten Internetzugriff auf firebase-Skripte von gstatic.com. ' +
+      'Öffne die Datei direkt im Browser (Doppelklick auf index.html) oder lade sie z.B. ' +
+      'auf GitHub Pages hoch — eine Vorschau innerhalb von Claude selbst blockiert externe ' +
+      'Netzwerkaufrufe und funktioniert hier nicht.</div>';
+    throw new Error("Firebase SDK not loaded — see on-page message.");
+  }
+
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.database();
+</script>
+
+<!-- Global safety net: shows a visible banner for any uncaught error, even
+     ones React's error boundary can't catch (e.g. inside event handlers or
+     async callbacks). Without this, such errors used to fail silently while
+     the app looked like it had just gone blank. -->
+<script>
+  function showGlobalErrorBanner(text) {
+    let el = document.getElementById("global-error-banner");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "global-error-banner";
+      el.style.cssText =
+        "position:fixed;bottom:0;left:0;right:0;z-index:99999;background:#C1272D;color:#fff;" +
+        "font-family:sans-serif;font-size:12px;padding:10px 12px;max-height:40vh;overflow:auto;" +
+        "white-space:pre-wrap;box-shadow:0 -2px 10px rgba(0,0,0,0.3);";
+      document.body.appendChild(el);
+    }
+    el.textContent = "⚠️ Fehler: " + text;
+  }
+  window.addEventListener("error", (e) => {
+    showGlobalErrorBanner((e.error && e.error.stack) || e.message || String(e));
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    showGlobalErrorBanner("(Promise) " + ((e.reason && e.reason.stack) || e.reason || String(e)));
+  });
+</script>
+
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ---------- constants ---------- */
+
+const EX_DEFS = [
+  { key: "A", name: "Koordinationsslalom", mode: "time", unit: "s", desc: "Ball auf dem Schläger im Slalom balancieren – schnelleres Team gewinnt." },
+  { key: "B", name: "Zielwurfstaffel", mode: "time", unit: "s", desc: "Acht Bälle nacheinander in den Eimer treffen – schnelleres Team gewinnt." },
+  { key: "C", name: "Einbeinsprung", mode: "distance", unit: "cm", desc: "Drei Sprünge auf einem Bein, gemeinsame Weite – weiteres Team gewinnt." },
+];
+
+const MATCH_DEFS = [
+  { id: "e1", type: "einzel", label: "Einzel 1", round: 1, pos: 2 },
+  { id: "e2", type: "einzel", label: "Einzel 2", round: 1, pos: 4 },
+  { id: "e3", type: "einzel", label: "Einzel 3", round: 2, pos: 1 },
+  { id: "e4", type: "einzel", label: "Einzel 4", round: 2, pos: 3 },
+  { id: "d1", type: "doppel", label: "Doppel 1" },
+  { id: "d2", type: "doppel", label: "Doppel 2" },
+];
+
+const STORAGE_KEY = "u9-kleinfeld-state-v1"; // legacy, unused since storage split into per-slice shared keys
+
+/* ---------- helpers: tennis scoring engine ---------- */
+
+function freshSet(isMTB = false) {
+  return { heimGames: 0, gastGames: 0, tbHeim: 0, tbGast: 0, inTB: false, finished: false, winner: null, isMTB };
+}
+function freshLive() {
+  return {
+    sets: [freshSet()],
+    setIndex: 0,
+    points: { heim: 0, gast: 0 },
+    winner: null,
+    wo: null,
+    serveConfig: { firstServer: null, heimStartsNear: null },
+    sideChangeCount: 0,
+  };
+}
+function normalizeLive(live) {
+  if (!live) return freshLive();
+  return {
+    ...live,
+    serveConfig: live.serveConfig || { firstServer: null, heimStartsNear: null },
+    sideChangeCount: typeof live.sideChangeCount === "number" ? live.sideChangeCount : 0,
+  };
+}
+// Firebase Realtime Database silently drops empty arrays/objects on write —
+// e.g. history: [] never actually gets stored, so reading a match back can
+// come back WITHOUT a history key at all. Always default it to [] here so
+// match.history.length never throws.
+function normalizeMatch(m) {
+  return {
+    live: normalizeLive(m && m.live),
+    history: Array.isArray(m && m.history) ? m.history : [],
+  };
+}
+function otherTeam(t) {
+  return t === "heim" ? "gast" : "heim";
+}
+function currentServerTeam(live) {
+  const cfg = live.serveConfig;
+  if (!cfg || !cfg.firstServer) return null;
+  let completedGames = 0;
+  live.sets.forEach((s, idx) => {
+    if (idx === live.setIndex || s.isMTB) return;
+    completedGames += s.heimGames + s.gastGames;
+  });
+  const cs = live.sets[live.setIndex];
+  if (!cs.isMTB) completedGames += cs.heimGames + cs.gastGames;
+  const base = completedGames % 2 === 0 ? cfg.firstServer : otherTeam(cfg.firstServer);
+  if (cs.inTB || cs.isMTB) {
+    const pts = cs.tbHeim + cs.tbGast;
+    if (pts === 0) return base;
+    const turn = Math.floor((pts + 1) / 2) % 2;
+    return turn === 0 ? base : otherTeam(base);
+  }
+  return base;
+}
+function currentHeimNear(live) {
+  const cfg = live.serveConfig;
+  if (!cfg || cfg.heimStartsNear === null || cfg.heimStartsNear === undefined) return true;
+  const swapped = live.sideChangeCount % 2 === 1;
+  return swapped ? !cfg.heimStartsNear : cfg.heimStartsNear;
+}
+function clone(o) {
+  return JSON.parse(JSON.stringify(o));
+}
+
+function advanceAfterSet(st) {
+  const finished = st.sets.filter((s) => s.finished);
+  const heimSets = finished.filter((s) => s.winner === "heim").length;
+  const gastSets = finished.filter((s) => s.winner === "gast").length;
+  if (heimSets === 2) { st.winner = "heim"; return; }
+  if (gastSets === 2) { st.winner = "gast"; return; }
+  if (heimSets === 1 && gastSets === 1) {
+    st.sets.push(freshSet(true));
+    st.setIndex = st.sets.length - 1;
+    return;
+  }
+  st.sets.push(freshSet(false));
+  st.setIndex = st.sets.length - 1;
+}
+
+function addPoint(live, side) {
+  if (live.winner || live.wo) return live;
+  const st = clone(live);
+  const cs = st.sets[st.setIndex];
+
+  if (cs.isMTB) {
+    if (side === "heim") cs.tbHeim++; else cs.tbGast++;
+    const a = cs.tbHeim, b = cs.tbGast;
+    const lead = side === "heim" ? a - b : b - a;
+    const val = side === "heim" ? a : b;
+    if (val >= 10 && lead >= 2) { cs.finished = true; cs.winner = side; st.winner = side; }
+    return st;
+  }
+  if (cs.inTB) {
+    if (side === "heim") cs.tbHeim++; else cs.tbGast++;
+    const a = cs.tbHeim, b = cs.tbGast;
+    const lead = side === "heim" ? a - b : b - a;
+    const val = side === "heim" ? a : b;
+    if (val >= 7 && lead >= 2) { cs.finished = true; cs.winner = side; advanceAfterSet(st); }
+    return st;
+  }
+  st.points[side]++;
+  if (st.points[side] === 4) {
+    if (side === "heim") cs.heimGames++; else cs.gastGames++;
+    st.points = { heim: 0, gast: 0 };
+    const gh = cs.heimGames, gg = cs.gastGames;
+    if (gh >= 4 && gh - gg >= 2) { cs.finished = true; cs.winner = "heim"; advanceAfterSet(st); }
+    else if (gg >= 4 && gg - gh >= 2) { cs.finished = true; cs.winner = "gast"; advanceAfterSet(st); }
+    else if (gh === 4 && gg === 4) { cs.inTB = true; }
+  }
+  return st;
+}
+
+function setWalkover(live, absentSide) {
+  const st = clone(live);
+  st.wo = absentSide;
+  st.winner = absentSide === "heim" ? "gast" : "heim";
+  return st;
+}
+
+const PT_LABEL = ["0", "15", "30", "40"];
+
+function serveSideOf(live) {
+  const cs = live.sets[live.setIndex];
+  const sum = (cs.isMTB || cs.inTB) ? cs.tbHeim + cs.tbGast : live.points.heim + live.points.gast;
+  return sum % 2 === 0 ? "rechts" : "links";
+}
+
+function pointLabel(live) {
+  const cs = live.sets[live.setIndex];
+  if (cs.isMTB) return `${cs.tbHeim} : ${cs.tbGast}`;
+  if (cs.inTB) return `${cs.tbHeim} : ${cs.tbGast}`;
+  return `${PT_LABEL[live.points.heim]} : ${PT_LABEL[live.points.gast]}`;
+}
+
+function setScoreStr(s) {
+  if (s.isMTB) return `${s.tbHeim}:${s.tbGast}`;
+  let str = `${s.heimGames}:${s.gastGames}`;
+  if (s.inTB || (s.finished && (s.tbHeim || s.tbGast))) str += ` (TB ${s.tbHeim}:${s.tbGast})`;
+  return str;
+}
+
+function matchTally(live) {
+  // returns {heimSets, gastSets, heimGames, gastGames}
+  let heimSets = 0, gastSets = 0, heimGames = 0, gastGames = 0;
+  live.sets.forEach((s) => {
+    if (s.finished) {
+      if (s.winner === "heim") heimSets++; else if (s.winner === "gast") gastSets++;
+      if (!s.isMTB) { heimGames += s.heimGames; gastGames += s.gastGames; }
+    }
+  });
+  return { heimSets, gastSets, heimGames, gastGames };
+}
+
+// Determines whether a match is automatically forfeited because one team's
+// squad is too small to fill a required position (e.g. a 3-player squad has
+// no position 4, so any Einzel/Doppel needing position 4 can't be played).
+// Returns the side that WINS by walkover, or null if both sides can field
+// the required positions (or both are equally short, which needs a manual
+// decision instead of an automatic one).
+function autoForfeitSide(state, def) {
+  const heimNeeds = def.type === "einzel" ? [def.pos] : state.doubles[def.id].heim;
+  const gastNeeds = def.type === "einzel" ? [def.pos] : state.doubles[def.id].gast;
+  const heimShort = heimNeeds.some((p) => p > state.players.heim.length);
+  const gastShort = gastNeeds.some((p) => p > state.players.gast.length);
+  if (heimShort && !gastShort) return "gast";
+  if (gastShort && !heimShort) return "heim";
+  return null;
+}
+
+/* ---------- default state ---------- */
+
+function defaultPlayers(n) {
+  return Array.from({ length: n }, (_, i) => ({ pos: i + 1, name: "" }));
+}
+
+function defaultState() {
+  return {
+    meta: {
+      saison: "",
+      liga: "",
+      gruppe: "",
+      berichtNr: "",
+      termin: "",
+      heimName: "",
+      gastName: "",
+      oberschiedsrichter: "",
+      bemerkungen: "",
+      osrSignature: "",
+      heimSignature: "",
+      gastSignature: "",
+    },
+    players: {
+      heim: defaultPlayers(4),
+      gast: defaultPlayers(4),
+    },
+    clubs: [],
+    playerPool: { heim: [], gast: [] },
+    motorik: EX_DEFS.reduce((acc, e) => {
+      acc[e.key] = { heim: "", gast: "", manualWinner: null };
+      return acc;
+    }, {}),
+    doubles: {
+      d1: { heim: [1, 2], gast: [1, 2] },
+      d2: { heim: [3, 4], gast: [3, 4] },
+    },
+    matches: MATCH_DEFS.reduce((acc, m) => {
+      acc[m.id] = { live: freshLive(), history: [] };
+      return acc;
+    }, {}),
+  };
+}
+
+/* ---------- motorik winner logic (shared) ---------- */
+
+function computeExWinner(ex, v) {
+  if (v.manualWinner) return v.manualWinner; // 'heim' | 'gast' | 'draw' set explicitly, overrides measured values
+  const hasBoth = v.heim !== "" && v.gast !== "";
+  if (!hasBoth) return null;
+  const hv = parseFloat(v.heim), gv = parseFloat(v.gast);
+  if (hv === gv) return "draw";
+  if (ex.mode === "time") return hv < gv ? "heim" : "gast";
+  return hv > gv ? "heim" : "gast";
+}
+
+/* ---------- import helpers (paste from BTV pages) ---------- */
+
+function parseRosterText(text) {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => {
+      const m = l.match(/^(?:Nr\.?\s*)?(\d{1,2})[.):]?\s+(.*)$/);
+      return m ? m[2].trim() : l;
+    })
+    .filter(
+      (name) =>
+        name.length > 1 &&
+        !/^(Name|Vorname|Spieler|Meldeliste|Position|ID-Nr\.?)/i.test(name)
+    );
+}
+
+// Handles a full paste of the BTV "Rangliste" table (Rang | LK | ID-Nummer |
+// Name, Vorname (Jahrgang) | Nation | SG | Einzel | Doppel | Gesamt) — pulls
+// out just "Nachname, Vorname" per row and sorts by the Rang column, so it
+// doesn't matter in what order the rows were selected/pasted.
+function parseRosterSmart(text) {
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const nameRe = /([A-ZÄÖÜ][\wäöüßÄÖÜ.\-]*(?:\s[A-ZÄÖÜ][\wäöüßÄÖÜ.\-]*)?,\s*[A-ZÄÖÜ][\wäöüßÄÖÜ.\-]*(?:\s[A-ZÄÖÜ][\wäöüßÄÖÜ.\-]*)?)/;
+  const ranked = [];
+  lines.forEach((line) => {
+    const rankMatch = line.match(/^(\d{1,3})\b/);
+    const nameMatch = line.match(nameRe);
+    if (rankMatch && nameMatch) {
+      ranked.push({ rank: parseInt(rankMatch[1], 10), name: nameMatch[1].trim() });
+    }
+  });
+  if (ranked.length) {
+    ranked.sort((a, b) => a.rank - b.rank);
+    return ranked.map((r) => r.name);
+  }
+  return parseRosterText(text);
+}
+
+function parseClubNames(text) {
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const clubs = new Set();
+  lines.forEach((l) => {
+    const matches = l.match(/([A-ZÄÖÜ][\wäöüßÄÖÜ.\-\s]{2,45}?\(\d{4,6}\))/g);
+    if (matches) matches.forEach((m) => clubs.add(m.trim()));
+  });
+  if (clubs.size === 0) {
+    lines.forEach((l) => {
+      if (l.length > 2 && l.length < 60 && !/^(Gruppe|Tabelle|Platz|Spieltag|Termin|Rang|Verein)/i.test(l)) {
+        clubs.add(l);
+      }
+    });
+  }
+  return Array.from(clubs);
+}
+
+/* ---------- storage helpers ----------
+   Data is split into small shared keys instead of one big blob so that
+   parents/trainers scoring different matches on different phones at the
+   same time don't overwrite each other's changes. Each match lives in its
+   own key/path in the Firebase Realtime Database. */
+
+const SHARED_KEYS = { meta: "u9-meta", players: "u9-players", clubs: "u9-clubs", motorik: "u9-motorik", doubles: "u9-doubles", playerPool: "u9-playerpool" };
+const ADMIN_LOCAL_KEY = "u9-admin-auth";
+const ADMIN_PASSWORD = "1234";
+
+function matchKey(id) {
+  return `u9-match-${id}`;
+}
+
+// one-off read/write (used for the admin-password-protected screens, which
+// don't need a live subscription — Setup/Motorik/Bericht just read+write
+// on demand, same as before)
+async function getShared(key) {
+  try {
+    const snap = await db.ref(key).once("value");
+    return snap.exists() ? snap.val() : null;
+  } catch (e) { return null; }
+}
+async function setShared(key, value) {
+  try { await db.ref(key).set(value); } catch (e) { /* ignore, e.g. offline */ }
+}
+
+// live subscription: fires immediately with the current value, then again
+// every time ANY device changes that path. Returns an unsubscribe function.
+function subscribeShared(key, onChange) {
+  const ref = db.ref(key);
+  const cb = ref.on("value", (snap) => onChange(snap.exists() ? snap.val() : null));
+  return () => ref.off("value", cb);
+}
+
+// admin unlock is a per-device preference, not shared data — plain
+// localStorage is fine here since this runs as a normal hosted page
+// (no sandbox restrictions like inside a Claude artifact).
+function loadAdminAuth() {
+  try { return localStorage.getItem(ADMIN_LOCAL_KEY) === "true"; } catch (e) { return false; }
+}
+function setAdminAuth(v) {
+  try { localStorage.setItem(ADMIN_LOCAL_KEY, v ? "true" : "false"); } catch (e) { /* ignore */ }
+}
+
+/* ---------- small UI atoms ---------- */
+
+function Chip({ children, tone = "default" }) {
+  return <span className={`chip chip-${tone}`}>{children}</span>;
+}
+
+function TeamLabel({ side, name }) {
+  const fallback = side === "heim" ? "Heim" : "Gast";
+  return <span className={`side-tag side-${side}`}>{name && name.trim() ? name : fallback}</span>;
+}
+
+/* ---------- QR code box (renders a scannable code for a match link) ---------- */
+
+function QRCodeBox({ url, hint }) {
+  const boxRef = useRef(null);
+
+  useEffect(() => {
+    if (!boxRef.current || typeof QRCode === "undefined") return;
+    boxRef.current.innerHTML = "";
+    new QRCode(boxRef.current, {
+      text: url,
+      width: 180,
+      height: 180,
+      colorDark: "#0A4A2B",
+      colorLight: "#ffffff",
+      correctLevel: QRCode.CorrectLevel.M,
+    });
+  }, [url]);
+
+  return (
+    <div className="qr-box">
+      <div ref={boxRef} className="qr-canvas-wrap" />
+      <p className="hint qr-hint">{hint || "Mit dem Handy scannen, um direkt bei diesem Spiel live mitzupunkten."}</p>
+    </div>
+  );
+}
+
+/* ---------- Signature pad (finger/mouse, saved as a PNG data URL) ---------- */
+
+function SignaturePad({ value, onSave }) {
+  const canvasRef = useRef(null);
+  const drawingRef = useRef(false);
+  const lastPos = useRef({ x: 0, y: 0 });
+  const [hasDrawing, setHasDrawing] = useState(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (value) {
+      const img = new Image();
+      img.onload = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      img.src = value;
+      setHasDrawing(true);
+    } else {
+      setHasDrawing(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const getPos = (e) => {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((e.clientX - rect.left) / rect.width) * canvas.width,
+      y: ((e.clientY - rect.top) / rect.height) * canvas.height,
+    };
+  };
+
+  const start = (e) => {
+    e.preventDefault();
+    drawingRef.current = true;
+    lastPos.current = getPos(e);
+  };
+  const move = (e) => {
+    if (!drawingRef.current) return;
+    e.preventDefault();
+    const ctx = canvasRef.current.getContext("2d");
+    if (!ctx) return;
+    const pos = getPos(e);
+    ctx.strokeStyle = "#132A20";
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(lastPos.current.x, lastPos.current.y);
+    ctx.lineTo(pos.x, pos.y);
+    ctx.stroke();
+    lastPos.current = pos;
+    setHasDrawing(true);
+  };
+  const end = () => { drawingRef.current = false; };
+
+  const clear = () => {
+    const canvas = canvasRef.current;
+    canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+    setHasDrawing(false);
+  };
+
+  const save = () => onSave(canvasRef.current.toDataURL("image/png"));
+
+  return (
+    <div className="sigpad">
+      <canvas
+        ref={canvasRef}
+        width={480}
+        height={180}
+        className="sigpad-canvas"
+        onPointerDown={start}
+        onPointerMove={move}
+        onPointerUp={end}
+        onPointerLeave={end}
+        onPointerCancel={end}
+      />
+      <p className="hint" style={{ margin: "6px 2px" }}>Mit dem Finger oder der Maus im Feld oben unterschreiben.</p>
+      <div className="sigpad-actions">
+        <button className="btn btn-small btn-ghost" onClick={clear}>Löschen</button>
+        <button className="btn btn-small btn-accent" onClick={save} disabled={!hasDrawing}>Übernehmen</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Court position indicator (persistent, not a popup) ---------- */
+
+function CourtPositionIndicator({ live, serverTeam, heimNear, clubNames }) {
+  const [flipped, setFlipped] = useState(false);
+  const [flippedRows, setFlippedRows] = useState(false);
+  const side = serveSideOf(live); // "rechts" (Deuce) or "links" (Ad)
+  const rightActive = side === "rechts";
+
+  // rotated 90°: the net runs vertically (as seen by someone standing at
+  // net height looking along it), the two baselines are left/right instead
+  // of top/bottom. "flipped" mirrors left/right, "flippedRows" mirrors
+  // top/bottom — both are just personal viewing-angle preferences, since
+  // people watch from different spots around the court.
+  const netX = 150, midY = 106, left = 14, right = 286, top = 30, bottom = 182;
+  const colW = netX - left;
+  const rowH = midY - top;
+
+  const effectiveHeimNear = flipped ? !heimNear : heimNear;
+  const leftTeam = effectiveHeimNear ? "heim" : "gast";
+  const server = serverTeam || "heim";
+  const returner = otherTeam(server);
+
+  const serverX = server === leftTeam ? left : netX;
+  const returnerX = returner === leftTeam ? left : netX;
+  const rightIsTop = flippedRows ? false : true;
+  const serverY = rightActive === rightIsTop ? top : midY;
+  const returnerY = rightActive === rightIsTop ? midY : top;
+
+  const teamColor = (t) => (t === "heim" ? "#0E6B3E" : "#0072BC");
+  const teamLabel = (t) => (t === "heim" ? (clubNames && clubNames.heim) || "Heim" : (clubNames && clubNames.gast) || "Gast");
+
+  const serverBox = { x: serverX, y: serverY, w: colW, h: rowH };
+  const returnerBox = { x: returnerX, y: returnerY, w: colW, h: rowH };
+
+  return (
+    <div className="court-indicator">
+      <svg viewBox="0 0 300 190" className="court-svg" role="img" aria-label={`Aufschlag ${teamLabel(server)} von ${side}`}>
+        <rect x={left} y={top} width={right - left} height={bottom - top} rx="6" fill="#C0392B" stroke="#ffffff" strokeWidth="3" />
+        <rect x={serverBox.x} y={serverBox.y} width={serverBox.w} height={serverBox.h} fill={teamColor(server)} fillOpacity="0.6" />
+        <rect x={returnerBox.x} y={returnerBox.y} width={returnerBox.w} height={returnerBox.h} fill={teamColor(returner)} fillOpacity="0.6" />
+        <line x1={left} y1={midY} x2={right} y2={midY} stroke="#ffffff" strokeWidth="2.5" />
+        <line x1={netX} y1={top} x2={netX} y2={bottom} stroke="#ffffff" strokeWidth="5" />
+        <text x={serverBox.x + serverBox.w / 2} y={serverBox.y + serverBox.h / 2 + 8} textAnchor="middle" fontFamily="Oswald, sans-serif" fontWeight="700" fontSize="22" fill="#fff">A</text>
+        <text x={returnerBox.x + returnerBox.w / 2} y={returnerBox.y + returnerBox.h / 2 + 8} textAnchor="middle" fontFamily="Oswald, sans-serif" fontWeight="700" fontSize="22" fill="#fff">R</text>
+        <line x1={netX} y1="4" x2={netX} y2={top - 2} stroke="#132A20" strokeWidth="2" />
+        <rect x={netX - 22} y="2" width="44" height="16" rx="3" fill="#132A20" />
+        <text x={netX} y="14" textAnchor="middle" fontFamily="Inter, sans-serif" fontWeight="600" fontSize="10" fill="#fff">Netz</text>
+        <text x={left + 4} y={bottom - 6} fontFamily="Inter, sans-serif" fontSize="9" fill="#fff" opacity="0.85">{effectiveHeimNear ? teamLabel("heim") : teamLabel("gast")}</text>
+        <text x={right - 4} y={bottom - 6} textAnchor="end" fontFamily="Inter, sans-serif" fontSize="9" fill="#fff" opacity="0.85">{effectiveHeimNear ? teamLabel("gast") : teamLabel("heim")}</text>
+      </svg>
+      <div className="court-caption">
+        <span className="court-legend"><span className="court-dot-legend" style={{ background: teamColor(server) }} /> Aufschläger: {teamLabel(server)} – von <strong>{side}</strong></span>
+        <span className="court-legend"><span className="court-dot-legend" style={{ background: teamColor(returner) }} /> Rückschläger: {teamLabel(returner)} – diagonal gegenüber</span>
+      </div>
+      <div className="court-flip-row">
+        <button className="btn btn-small btn-ghost" onClick={() => setFlipped((f) => !f)}>↔️ Seiten tauschen</button>
+        <button className="btn btn-small btn-ghost" onClick={() => setFlippedRows((f) => !f)}>↕️ Ansicht drehen</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- pre-match serve/side setup modal ---------- */
+
+function ServeSetupModal({ names, clubNames, onConfirm }) {
+  const [firstServer, setFirstServer] = useState(null);
+  const heimLabel = (clubNames && clubNames.heim) || "Heim";
+  const gastLabel = (clubNames && clubNames.gast) || "Gast";
+
+  if (!firstServer) {
+    return (
+      <div className="deuce-backdrop">
+        <div className="deuce-modal">
+          <div className="deuce-title">Wer schlägt zuerst auf?</div>
+          <p className="deuce-text">Bevor es losgeht: welches Team hat den ersten Aufschlag?</p>
+          <div className="serve-setup-btns">
+            <button className="btn btn-heim btn-block" onClick={() => setFirstServer("heim")}>{names.heim} ({heimLabel})</button>
+            <button className="btn btn-gast btn-block" onClick={() => setFirstServer("gast")}>{names.gast} ({gastLabel})</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="deuce-backdrop">
+      <div className="deuce-modal">
+        <div className="deuce-title">Auf welcher Seite steht {heimLabel}?</div>
+        <p className="deuce-text">In der Positions-Grafik unten: Auf welcher Seite startet {names.heim} ({heimLabel})?</p>
+        <div className="serve-setup-btns">
+          <button className="btn btn-accent btn-block" onClick={() => onConfirm({ firstServer, heimStartsNear: true })}>{heimLabel}: linke Seite</button>
+          <button className="btn btn-outline btn-block" onClick={() => onConfirm({ firstServer, heimStartsNear: false })}>{heimLabel}: rechte Seite</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Stopwatch ---------- */
+
+function Stopwatch({ value, onChange, side }) {
+  const [running, setRunning] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const startRef = useRef(null);
+  const rafRef = useRef(null);
+
+  useEffect(() => {
+    if (!running) return;
+    const tick = () => {
+      setElapsed((Date.now() - startRef.current) / 1000);
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    startRef.current = Date.now() - elapsed * 1000;
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
+
+  const start = () => setRunning(true);
+  const stop = () => {
+    setRunning(false);
+    onChange(elapsed.toFixed(1));
+  };
+  const reset = () => { setRunning(false); setElapsed(0); onChange(""); };
+
+  return (
+    <div className="stopwatch">
+      <div className="stopwatch-time">{elapsed.toFixed(1)}s</div>
+      <div className="stopwatch-btns">
+        {!running ? (
+          <button className="btn btn-small btn-accent" onClick={start}>Start</button>
+        ) : (
+          <button className="btn btn-small btn-stop" onClick={stop}>Stopp</button>
+        )}
+        <button className="btn btn-small btn-ghost" onClick={reset}>Reset</button>
+      </div>
+      {value !== "" && !running && <div className="stopwatch-saved">Gespeichert: {value}s</div>}
+    </div>
+  );
+}
+
+/* ---------- Setup Screen ---------- */
+
+function SetupScreen({ state, setState, onLockAdmin }) {
+  const [editUnlocked, setEditUnlocked] = useState(false);
+  const updateMeta = (k, v) => setState((s) => ({ ...s, meta: { ...s.meta, [k]: v } }));
+
+  const resetEverything = () => {
+    const sure = window.confirm(
+      "Wirklich ALLES zurücksetzen?\n\nDas löscht unwiderruflich für ALLE Geräte: Mannschaften, Spieler, Vereinsverzeichnis, Motorik-Ergebnisse, Doppel-Aufstellungen und alle 6 Spielstände.\n\nDas kann nicht rückgängig gemacht werden."
+    );
+    if (!sure) return;
+    const sureAgain = window.confirm("Ganz sicher? Letzte Bestätigung.");
+    if (!sureAgain) return;
+
+    const base = defaultState();
+    setShared(SHARED_KEYS.meta, base.meta);
+    setShared(SHARED_KEYS.players, base.players);
+    setShared(SHARED_KEYS.clubs, base.clubs);
+    setShared(SHARED_KEYS.playerPool, base.playerPool);
+    setShared(SHARED_KEYS.motorik, base.motorik);
+    setShared(SHARED_KEYS.doubles, base.doubles);
+    MATCH_DEFS.forEach((d) => setShared(matchKey(d.id), base.matches[d.id]));
+    setState(base);
+  };
+
+  const updatePlayer = (side, idx, field, value) => {
+    setState((s) => {
+      const list = s.players[side].map((p, i) => (i === idx ? { ...p, [field]: value } : p));
+      return { ...s, players: { ...s.players, [side]: list } };
+    });
+  };
+  const movePlayer = (side, idx, dir) => {
+    setState((s) => {
+      const arr = [...s.players[side]];
+      const target = idx + dir;
+      if (target < 0 || target >= arr.length) return s;
+      const nameA = arr[idx].name, nameB = arr[target].name;
+      arr[idx] = { ...arr[idx], name: nameB };
+      arr[target] = { ...arr[target], name: nameA };
+      return { ...s, players: { ...s.players, [side]: arr } };
+    });
+  };
+  const addPlayer = (side) => {
+    setState((s) => {
+      if (s.players[side].length >= 8) return s;
+      const nextPos = s.players[side].length + 1;
+      return { ...s, players: { ...s.players, [side]: [...s.players[side], { pos: nextPos, name: "" }] } };
+    });
+  };
+  const removePlayer = (side) => {
+    setState((s) => {
+      if (s.players[side].length <= 3) return s;
+      const last = s.players[side][s.players[side].length - 1];
+      if (last.name && last.name.trim() && !window.confirm(`Position ${last.pos} ("${last.name}") wirklich entfernen?`)) return s;
+      return { ...s, players: { ...s.players, [side]: s.players[side].slice(0, -1) } };
+    });
+  };
+  const applyRoster = (side, names) => {
+    setState((s) => {
+      const hasExisting = s.players[side].some((p) => p.name && p.name.trim());
+      if (hasExisting && !window.confirm("Das ersetzt die aktuell eingetragenen Spielernamen für diesen Verein. Fortfahren?")) return s;
+      const n = Math.max(4, Math.min(8, names.length || 4));
+      const list = Array.from({ length: n }, (_, i) => ({ pos: i + 1, name: names[i] || "" }));
+      return { ...s, players: { ...s.players, [side]: list } };
+    });
+  };
+  const applyPool = (side, names) => {
+    setState((s) => ({ ...s, playerPool: { ...s.playerPool, [side]: names.slice(0, 30) } }));
+  };
+  const assignFromPool = (side, idx, name) => {
+    if (!name) return;
+    updatePlayer(side, idx, "name", name);
+  };
+  const addClub = (name) => {
+    if (!name || !name.trim()) return;
+    setState((s) => (s.clubs.includes(name) ? s : { ...s, clubs: [...s.clubs, name.trim()] }));
+  };
+  const mergeClubs = (names) => {
+    setState((s) => {
+      const set = new Set(s.clubs);
+      names.forEach((n) => set.add(n));
+      return { ...s, clubs: Array.from(set) };
+    });
+  };
+
+  const [importOpen, setImportOpen] = useState({ heim: false, gast: false });
+  const [rosterText, setRosterText] = useState({ heim: "", gast: "" });
+  const [poolOpen, setPoolOpen] = useState({ heim: false, gast: false });
+  const [poolText, setPoolText] = useState({ heim: "", gast: "" });
+  const [clubOpen, setClubOpen] = useState(false);
+  const [clubText, setClubText] = useState("");
+  const [newClub, setNewClub] = useState("");
+
+  return (
+    <div className="screen">
+      <div className="screen-title-row">
+        <h2 className="screen-title">Mannschaften &amp; Spiel</h2>
+        <button className="btn btn-small btn-ghost" onClick={onLockAdmin}>Admin abmelden</button>
+      </div>
+
+      <div className={`setup-lock-banner ${editUnlocked ? "setup-lock-banner-open" : ""}`}>
+        <span>{editUnlocked ? "🔓 Bearbeitung freigeschaltet — Änderungen werden sofort für alle gespeichert." : "🔒 Setup ist gesperrt — nur Ansicht, keine versehentlichen Änderungen möglich."}</span>
+        <button className="btn btn-small btn-accent" onClick={() => setEditUnlocked((v) => !v)}>
+          {editUnlocked ? "Sperren" : "Bearbeiten freischalten"}
+        </button>
+      </div>
+
+      <div className={`setup-lock-wrap ${editUnlocked ? "" : "setup-locked"}`}>
+      <div className="card">
+        <div className="field-row">
+          <label>Saison / Verband (Kopfzeile Spielbericht)</label>
+          <input value={state.meta.saison} onChange={(e) => updateMeta("saison", e.target.value)} placeholder="z.B. Südbayern 2026" />
+        </div>
+        <div className="field-row">
+          <label>Liga / Gruppe</label>
+          <input value={state.meta.liga} onChange={(e) => updateMeta("liga", e.target.value)} placeholder="z.B. Dunlop Kleinfeld U9 Südliga 2 Gr. 955" />
+        </div>
+        <div className="field-row">
+          <label>Spielbericht-Nr.</label>
+          <input value={state.meta.berichtNr} onChange={(e) => updateMeta("berichtNr", e.target.value)} placeholder="z.B. 20478" />
+        </div>
+        <div className="field-row">
+          <label>Termin</label>
+          <input type="datetime-local" value={state.meta.termin} onChange={(e) => updateMeta("termin", e.target.value)} />
+        </div>
+        <div className="field-row">
+          <label>Oberschiedsrichter (Name)</label>
+          <input value={state.meta.oberschiedsrichter} onChange={(e) => updateMeta("oberschiedsrichter", e.target.value)} placeholder="Name des OSR" />
+        </div>
+        <div className="field-row">
+          <label>Bemerkungen (für Spielbericht)</label>
+          <textarea
+            className="paste-area"
+            rows={2}
+            value={state.meta.bemerkungen}
+            onChange={(e) => updateMeta("bemerkungen", e.target.value)}
+            placeholder="z.B. Absage, Verlegung, Auffälligkeiten..."
+          />
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-head"><span className="ex-name">Vereinsverzeichnis</span></div>
+        <p className="hint" style={{ marginTop: 0 }}>
+          Vereine aus der{" "}
+          <a className="link" href="https://www.btv.de/de/spielbetrieb/tabelle-spielplan.html?groupid=2216839" target="_blank" rel="noreferrer">
+            Gruppenübersicht
+          </a>{" "}
+          im Browser öffnen, Tabelle markieren &amp; hier einfügen, oder einzeln hinzufügen.
+        </p>
+        {!clubOpen ? (
+          <button className="btn btn-small btn-ghost" onClick={() => setClubOpen(true)}>+ Vereine einfügen / hinzufügen</button>
+        ) : (
+          <>
+            <textarea
+              className="paste-area"
+              rows={4}
+              placeholder={"Tabelle hier einfügen, z.B.:\nTC Bad Aibling (02029)\nTC Weiß-Blau Raubling (02289)"}
+              value={clubText}
+              onChange={(e) => setClubText(e.target.value)}
+            />
+            <div className="player-actions">
+              <button
+                className="btn btn-small btn-accent"
+                onClick={() => { mergeClubs(parseClubNames(clubText)); setClubText(""); }}
+              >
+                Übernehmen
+              </button>
+              <button className="btn btn-small btn-ghost" onClick={() => setClubOpen(false)}>Schließen</button>
+            </div>
+            <div className="field-row" style={{ marginTop: 10 }}>
+              <label>Einzelnen Verein hinzufügen</label>
+              <div className="inline-add">
+                <input value={newClub} onChange={(e) => setNewClub(e.target.value)} placeholder="Vereinsname" />
+                <button className="btn btn-small btn-ghost" onClick={() => { addClub(newClub); setNewClub(""); }}>+</button>
+              </div>
+            </div>
+          </>
+        )}
+        {state.clubs.length > 0 && (
+          <div className="club-chip-list">
+            {state.clubs.map((c) => <Chip key={c}>{c}</Chip>)}
+          </div>
+        )}
+      </div>
+
+      {["heim", "gast"].map((side) => (
+        <div className="card" key={side}>
+          <div className="card-head">
+            <TeamLabel side={side} name={state.meta[side === "heim" ? "heimName" : "gastName"]} />
+            <input
+              className="team-name-input"
+              placeholder={side === "heim" ? "Heimverein" : "Gastverein"}
+              value={state.meta[side === "heim" ? "heimName" : "gastName"]}
+              onChange={(e) => updateMeta(side === "heim" ? "heimName" : "gastName", e.target.value)}
+            />
+          </div>
+          {state.clubs.length > 0 && (
+            <div className="field-row">
+              <label>Aus Vereinsverzeichnis wählen</label>
+              <select
+                value=""
+                onChange={(e) => { if (e.target.value) updateMeta(side === "heim" ? "heimName" : "gastName", e.target.value); }}
+              >
+                <option value="">– Verein wählen –</option>
+                {state.clubs.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+          )}
+
+          <div className="players-list">
+            {state.players[side].map((p, idx) => (
+              <div className="player-row" key={idx}>
+                <span className="player-pos">{p.pos}</span>
+                <div className="player-row-fields">
+                  <input
+                    placeholder={`Spieler Position ${p.pos}`}
+                    value={p.name}
+                    onChange={(e) => updatePlayer(side, idx, "name", e.target.value)}
+                  />
+                  {state.playerPool[side].length > 0 && (
+                    <select
+                      className="player-pool-select"
+                      value=""
+                      onChange={(e) => assignFromPool(side, idx, e.target.value)}
+                    >
+                      <option value="">– aus Meldeliste wählen –</option>
+                      {state.playerPool[side].map((n, i) => (
+                        <option key={i} value={n}>{n}</option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+                <div className="player-move-btns">
+                  <button
+                    className="btn btn-small btn-ghost player-move-btn"
+                    onClick={() => movePlayer(side, idx, -1)}
+                    disabled={idx === 0}
+                    aria-label="Nach oben"
+                  >
+                    ↑
+                  </button>
+                  <button
+                    className="btn btn-small btn-ghost player-move-btn"
+                    onClick={() => movePlayer(side, idx, 1)}
+                    disabled={idx === state.players[side].length - 1}
+                    aria-label="Nach unten"
+                  >
+                    ↓
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="player-actions">
+            <button className="btn btn-small btn-ghost" onClick={() => addPlayer(side)} disabled={state.players[side].length >= 8}>+ Spieler</button>
+            <button className="btn btn-small btn-ghost" onClick={() => removePlayer(side)} disabled={state.players[side].length <= 3}>– Spieler</button>
+          </div>
+
+          {!poolOpen[side] ? (
+            <button
+              className="btn btn-small btn-ghost"
+              style={{ marginTop: 10 }}
+              onClick={() => setPoolOpen((o) => ({ ...o, [side]: true }))}
+            >
+              + Komplette Meldeliste einfügen (bis 30 Spieler)
+            </button>
+          ) : (
+            <div className="import-panel">
+              <p className="hint" style={{ marginTop: 0 }}>
+                Komplette Meldeliste bzw. Rangliste des Vereins (bis zu 30 Namen) einfügen. Die App zieht nur die Namen raus
+                und sortiert nach Rang, falls vorhanden. Diese Liste steht danach bei jeder Position als Dropdown zur Auswahl
+                bereit — unabhängig davon, wer aktuell für dieses Spiel gemeldet ist.
+              </p>
+              <textarea
+                className="paste-area"
+                rows={6}
+                placeholder={"z.B.:\n1 Max Mustermann\n2 Lina Beispiel\n3 ...\nbis zu 30 Zeilen"}
+                value={poolText[side]}
+                onChange={(e) => setPoolText((r) => ({ ...r, [side]: e.target.value }))}
+              />
+              <div className="player-actions">
+                <button
+                  className="btn btn-small btn-accent"
+                  onClick={() => { applyPool(side, parseRosterSmart(poolText[side])); setPoolText((r) => ({ ...r, [side]: "" })); setPoolOpen((o) => ({ ...o, [side]: false })); }}
+                >
+                  Übernehmen
+                </button>
+                <button className="btn btn-small btn-ghost" onClick={() => setPoolOpen((o) => ({ ...o, [side]: false }))}>Abbrechen</button>
+              </div>
+            </div>
+          )}
+          {state.playerPool[side].length > 0 && (
+            <p className="hint" style={{ marginTop: 6 }}>
+              Meldeliste hinterlegt: {state.playerPool[side].length} Spieler.
+            </p>
+          )}
+
+          {!importOpen[side] ? (
+            <button
+              className="btn btn-small btn-ghost"
+              style={{ marginTop: 10 }}
+              onClick={() => setImportOpen((o) => ({ ...o, [side]: true }))}
+            >
+              + Kader aus BTV-{side === "heim" ? "Teamportrait" : "Meldeliste"} übernehmen
+            </button>
+          ) : (
+            <div className="import-panel">
+              <p className="hint" style={{ marginTop: 0 }}>
+                {side === "heim" ? (
+                  <>
+                    Auf der{" "}
+                    <a className="link" href="https://www.btv.de/de/spielbetrieb/teamportrait.html?teamid=3580114" target="_blank" rel="noreferrer">
+                      BTV-Teamseite
+                    </a>{" "}
+                    die ganze Rangliste (inkl. Rang, ID-Nummer, Jahrgang, Einzel/Doppel-Werten) markieren, kopieren und hier
+                    einfügen – die App zieht sich nur die Namen raus und sortiert automatisch nach Rang. Bei mehreren Seiten
+                    einfach nacheinander einfügen. Übernommen werden die ersten 4–8 (mehr Plätze gibt's aktuell nicht).
+                  </>
+                ) : (
+                  "Meldeliste oder Rangliste des Gastvereins kopieren und hier einfügen – die App erkennt Namen und Rang automatisch und sortiert entsprechend."
+                )}
+              </p>
+              <textarea
+                className="paste-area"
+                rows={5}
+                placeholder={"z.B.:\n1 Max Mustermann\n2 Lina Beispiel\n3 ...\n4 ..."}
+                value={rosterText[side]}
+                onChange={(e) => setRosterText((r) => ({ ...r, [side]: e.target.value }))}
+              />
+              <div className="player-actions">
+                <button
+                  className="btn btn-small btn-accent"
+                  onClick={() => { applyRoster(side, parseRosterSmart(rosterText[side])); setRosterText((r) => ({ ...r, [side]: "" })); setImportOpen((o) => ({ ...o, [side]: false })); }}
+                >
+                  Übernehmen
+                </button>
+                <button className="btn btn-small btn-ghost" onClick={() => setImportOpen((o) => ({ ...o, [side]: false }))}>Abbrechen</button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+
+      <p className="hint">Positionen 1–4 bilden die Stammformation für die Einzel. Zusätzliche Spieler (5–8) stehen als Ersatz bzw. für weitere Mannschaften zur Verfügung. Da die BTV-Seiten die Meldelisten per JavaScript-Widget laden, lässt sich der Kader nicht automatisch abrufen — daher der Einfüge-Weg oben.</p>
+      <p className="hint">Mit "– Spieler" lässt sich der Kader auf 3 Spieler reduzieren (Antreten zu Dritt). Einzel bzw. Doppel, die Position 4 benötigen, werden dann automatisch als w.o. gewertet und in Bericht/Live-Ansicht entsprechend verrechnet — es sei denn, es wird trotzdem ein Ergebnis für dieses Spiel eingetragen (z.B. mit Ersatzspieler).</p>
+      </div>
+
+      <div className="card danger-card">
+        <div className="card-head"><span className="ex-name">Gefahrenzone</span></div>
+        <p className="hint" style={{ marginTop: 0 }}>
+          Setzt Mannschaften, Vereinsverzeichnis, Motorik-Ergebnisse und alle 6 Spielstände komplett zurück – für alle
+          Geräte, die diese App gerade offen haben. Nur für einen neuen Spieltag verwenden.
+        </p>
+        <button className="btn btn-block danger-btn" onClick={resetEverything}>
+          ⚠️ Alles zurücksetzen (neuer Spieltag)
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Motorik Screen ---------- */
+
+function MotorikScreen({ state, setState }) {
+  const updateVal = (key, side, val) => {
+    setState((s) => ({ ...s, motorik: { ...s.motorik, [key]: { ...s.motorik[key], [side]: val } } }));
+  };
+  const setManualWinner = (key, winner) => {
+    setState((s) => ({ ...s, motorik: { ...s.motorik, [key]: { ...s.motorik[key], manualWinner: winner } } }));
+  };
+
+  const results = EX_DEFS.map((ex) => ({ ...ex, winner: computeExWinner(ex, state.motorik[ex.key]) }));
+
+  const points = { heim: 0, gast: 0 };
+  results.forEach((r) => {
+    if (r.winner === "heim") points.heim += 2;
+    else if (r.winner === "gast") points.gast += 2;
+    else if (r.winner === "draw") { points.heim += 1; points.gast += 1; }
+  });
+
+  return (
+    <div className="screen">
+      <h2 className="screen-title">Motorik-Wettkampf</h2>
+      {EX_DEFS.map((ex) => {
+        const v = state.motorik[ex.key];
+        const r = results.find((x) => x.key === ex.key);
+        return (
+          <div className="card" key={ex.key}>
+            <div className="card-head">
+              <span className="ex-badge">{ex.key}</span>
+              <div>
+                <div className="ex-name">{ex.name}</div>
+                <div className="ex-desc">{ex.desc}</div>
+              </div>
+            </div>
+            <div className="motorik-grid">
+              <div className="motorik-col">
+                <TeamLabel side="heim" name={state.meta.heimName} />
+                {ex.mode === "time" ? (
+                  <Stopwatch value={v.heim} onChange={(val) => updateVal(ex.key, "heim", val)} side="heim" />
+                ) : (
+                  <div className="distance-input">
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      placeholder="cm"
+                      value={v.heim}
+                      onChange={(e) => updateVal(ex.key, "heim", e.target.value)}
+                    />
+                    <span className="unit">cm</span>
+                  </div>
+                )}
+              </div>
+              <div className="motorik-col">
+                <TeamLabel side="gast" name={state.meta.gastName} />
+                {ex.mode === "time" ? (
+                  <Stopwatch value={v.gast} onChange={(val) => updateVal(ex.key, "gast", val)} side="gast" />
+                ) : (
+                  <div className="distance-input">
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      placeholder="cm"
+                      value={v.gast}
+                      onChange={(e) => updateVal(ex.key, "gast", e.target.value)}
+                    />
+                    <span className="unit">cm</span>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="ex-manual-row">
+              <span className="ex-manual-label">Sieger direkt festlegen:</span>
+              <div className="ex-manual-btns">
+                <button
+                  className={`btn btn-small ${v.manualWinner === "heim" ? "btn-heim" : "btn-outline"}`}
+                  onClick={() => setManualWinner(ex.key, "heim")}
+                >
+                  Heim
+                </button>
+                <button
+                  className={`btn btn-small ${v.manualWinner === "draw" ? "btn-accent" : "btn-outline"}`}
+                  onClick={() => setManualWinner(ex.key, "draw")}
+                >
+                  Gleich
+                </button>
+                <button
+                  className={`btn btn-small ${v.manualWinner === "gast" ? "btn-gast" : "btn-outline"}`}
+                  onClick={() => setManualWinner(ex.key, "gast")}
+                >
+                  Gast
+                </button>
+                {v.manualWinner && (
+                  <button className="btn btn-small btn-ghost" onClick={() => setManualWinner(ex.key, null)}>
+                    Zurücksetzen
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {r.winner && (
+              <div className="ex-result">
+                {r.winner === "draw" ? "Unentschieden – je 1 Punkt" : `${r.winner === "heim" ? "Heim" : "Gast"} gewinnt – 2 Punkte`}
+                {v.manualWinner && <span className="ex-manual-tag"> (manuell)</span>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      <div className="card total-card">
+        <div className="total-row">
+          <span>Motorik gesamt</span>
+          <span className="total-score">{points.heim} : {points.gast}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Matches list + live scorer ---------- */
+
+function playerName(state, side, pos) {
+  const p = state.players[side].find((pl) => pl.pos === pos);
+  return p && p.name ? p.name : `Pos. ${pos}`;
+}
+
+function matchPlayers(state, def) {
+  if (def.type === "einzel") {
+    return {
+      heim: playerName(state, "heim", def.pos),
+      gast: playerName(state, "gast", def.pos),
+    };
+  }
+  const dd = state.doubles[def.id];
+  return {
+    heim: dd.heim.map((p) => playerName(state, "heim", p)).join(" / "),
+    gast: dd.gast.map((p) => playerName(state, "gast", p)).join(" / "),
+  };
+}
+
+function statusOf(live) {
+  if (live.winner) return "done";
+  const played = live.sets.some((s) => s.finished) || live.points.heim || live.points.gast || live.sets[live.setIndex].heimGames || live.sets[live.setIndex].gastGames;
+  return played ? "live" : "pending";
+}
+
+function MatchesScreen({ state, setState, openMatch, isAdmin }) {
+  const updateDoubles = (id, side, idx, value) => {
+    setState((s) => {
+      const arr = [...s.doubles[id][side]];
+      arr[idx] = parseInt(value, 10);
+      return { ...s, doubles: { ...s.doubles, [id]: { ...s.doubles[id], [side]: arr } } };
+    });
+  };
+
+  const resetMatchById = (def) => {
+    if (!window.confirm(`"${def.label}" wirklich komplett zurücksetzen? Alle Punkte und Sätze gehen verloren.`)) return;
+    const fresh = { live: freshLive(), history: [] };
+    setShared(matchKey(def.id), fresh);
+    setState((s) => ({ ...s, matches: { ...s.matches, [def.id]: fresh } }));
+  };
+
+  const [linkFor, setLinkFor] = useState(null);
+  const [qrFor, setQrFor] = useState(null);
+  const shareUrl = (id) => `${window.location.href.split("#")[0]}#match=${id}`;
+  const copyLink = async (id) => {
+    const url = shareUrl(id);
+    try { await navigator.clipboard.writeText(url); } catch (e) { /* clipboard blocked, show box below instead */ }
+    setLinkFor((cur) => (cur === id ? null : id));
+  };
+
+  return (
+    <div className="screen">
+      <h2 className="screen-title">Spiele</h2>
+      <div className="matchup-header">
+        <TeamLabel side="heim" name={state.meta.heimName} />
+        <span className="vs">vs</span>
+        <TeamLabel side="gast" name={state.meta.gastName} />
+      </div>
+      {MATCH_DEFS.map((def) => {
+        const m = state.matches[def.id];
+        const names = matchPlayers(state, def);
+        const st = statusOf(m.live);
+        const t = matchTally(m.live);
+        const af = !m.live.winner ? autoForfeitSide(state, def) : null;
+        return (
+          <div className="card match-card" key={def.id}>
+            <div className="match-card-head">
+              <span className="match-label">{def.label}</span>
+              <Chip tone={st === "done" ? "done" : st === "live" ? "live" : "pending"}>
+                {st === "done" ? "Beendet" : st === "live" ? "Läuft" : "Offen"}
+              </Chip>
+            </div>
+            {af && (
+              <div className="auto-wo-note">
+                ⚠️ Automatisch w.o.: {af === "heim" ? (state.meta.gastName || "Gast") : (state.meta.heimName || "Heim")} hat zu wenig
+                Spieler für {def.type === "einzel" ? `Position ${def.pos}` : "diese Doppel-Aufstellung"} —
+                {" "}{af === "heim" ? (state.meta.heimName || "Heim") : (state.meta.gastName || "Gast")} bekommt die Punkte automatisch,
+                außer es wird trotzdem gespielt (z.B. mit Ersatzspieler).
+              </div>
+            )}
+
+            {def.type === "doppel" && (
+              <div className="doubles-select">
+                {["heim", "gast"].map((side) => (
+                  <div className="doubles-side" key={side}>
+                    <TeamLabel side={side} name={state.meta[side === "heim" ? "heimName" : "gastName"]} />
+                    {[0, 1].map((idx) => (
+                      <select
+                        key={idx}
+                        value={state.doubles[def.id][side][idx]}
+                        onChange={(e) => updateDoubles(def.id, side, idx, e.target.value)}
+                      >
+                        {state.players[side].map((p) => (
+                          <option key={p.pos} value={p.pos}>
+                            {p.pos}. {p.name || `Pos. ${p.pos}`}
+                          </option>
+                        ))}
+                      </select>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="match-names">
+              <span>{names.heim}</span>
+              <span className="vs">vs</span>
+              <span>{names.gast}</span>
+            </div>
+
+            {(m.live.wo || m.live.winner) ? (
+              <div className="match-summary">
+                {m.live.wo ? (
+                  <span>w.o. – Sieger: {m.live.winner === "heim" ? names.heim : names.gast}</span>
+                ) : (
+                  <span>
+                    Ergebnis: {t.heimSets}:{t.gastSets} Sätze — Sieger: {m.live.winner === "heim" ? names.heim : names.gast}
+                  </span>
+                )}
+              </div>
+            ) : (
+              st === "live" && (
+                <div className="match-summary">
+                  Sätze {t.heimSets}:{t.gastSets} · Aktuell {pointLabel(m.live)}
+                </div>
+              )
+            )}
+
+            <button className="btn btn-accent btn-block" onClick={() => openMatch(def.id)}>
+              {st === "pending" ? "Spiel starten" : st === "live" ? "Weiter erfassen" : "Ergebnis ansehen"}
+            </button>
+            <div className="match-share-row">
+              <button className="btn btn-ghost btn-small" onClick={() => copyLink(def.id)}>
+                🔗 Link kopieren
+              </button>
+              <button className="btn btn-ghost btn-small" onClick={() => setQrFor((cur) => (cur === def.id ? null : def.id))}>
+                ▦ QR-Code
+              </button>
+            </div>
+            {linkFor === def.id && (
+              <div className="share-link-box">
+                <input readOnly value={shareUrl(def.id)} onFocus={(e) => e.target.select()} />
+                <p className="hint" style={{ margin: "4px 2px 0" }}>
+                  In die Zwischenablage kopiert (falls das nicht geklappt hat: Text oben markieren &amp; kopieren).
+                </p>
+              </div>
+            )}
+            {qrFor === def.id && <QRCodeBox url={shareUrl(def.id)} />}
+            {isAdmin && (
+              <button className="btn btn-ghost btn-small admin-reset-btn" onClick={() => resetMatchById(def)}>
+                🔄 Spiel zurücksetzen (Admin)
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function LiveMatchOverlay({ state, setState, matchId, close, matchesReady }) {
+  const def = MATCH_DEFS.find((d) => d.id === matchId);
+  const match = state.matches[matchId];
+  const names = matchPlayers(state, def);
+  const live = match.live;
+  const [showDeuce, setShowDeuce] = useState(false);
+  const [showSideChange, setShowSideChange] = useState(false);
+
+  const persist = (matchObj) => setShared(matchKey(matchId), matchObj);
+
+  const commit = (newLive, pushHistory = true) => {
+    setState((s) => {
+      const cur = s.matches[matchId];
+      const history = pushHistory ? [...cur.history, cur.live] : cur.history;
+      const next = { live: newLive, history };
+      persist(next);
+      return { ...s, matches: { ...s.matches, [matchId]: next } };
+    });
+  };
+
+  const point = (side) => {
+    const newLive = addPoint(live, side);
+    const ncs = newLive.sets[newLive.setIndex];
+
+    if (!ncs.isMTB && !ncs.inTB && newLive.points.heim === 3 && newLive.points.gast === 3) {
+      setShowDeuce(true);
+    }
+
+    // side-of-court change: after a game finishes with an odd total of games
+    // played in the set, or every 6 points during a (match-)tiebreak
+    const wasSet = newLive.sets[live.setIndex];
+    if (!newLive.winner) {
+      if (!wasSet.isMTB) {
+        const gameJustEnded = wasSet.heimGames + wasSet.gastGames !== cs.heimGames + cs.gastGames;
+        if (gameJustEnded && (wasSet.heimGames + wasSet.gastGames) % 2 === 1) {
+          setShowSideChange(true);
+          newLive.sideChangeCount = (newLive.sideChangeCount || 0) + 1;
+        }
+      }
+      if (wasSet.inTB || wasSet.isMTB) {
+        const tbSum = wasSet.tbHeim + wasSet.tbGast;
+        if (tbSum > 0 && tbSum % 6 === 0) {
+          setShowSideChange(true);
+          newLive.sideChangeCount = (newLive.sideChangeCount || 0) + 1;
+        }
+      }
+    }
+
+    commit(newLive);
+  };
+  const undo = () => {
+    if (!match.history.length) return;
+    setShowDeuce(false);
+    setShowSideChange(false);
+    const prev = match.history[match.history.length - 1];
+    const next = { live: prev, history: match.history.slice(0, -1) };
+    persist(next);
+    setState((s) => ({ ...s, matches: { ...s.matches, [matchId]: next } }));
+  };
+  const walkover = (absentSide) => commit(setWalkover(live, absentSide));
+  const resetMatch = () => {
+    if (!window.confirm("Dieses Spiel wirklich komplett zurücksetzen? Alle Punkte und Sätze gehen verloren.")) return;
+    commit(freshLive(), false);
+  };
+  const setServeConfig = (cfg) => commit({ ...live, serveConfig: cfg }, false);
+
+  const cs = live.sets[live.setIndex];
+  const t = matchTally(live);
+  const finished = !!live.winner;
+  const needsServeSetup = matchesReady && (!live.serveConfig || !live.serveConfig.firstServer);
+  const serverTeam = currentServerTeam(live);
+  const heimNear = currentHeimNear(live);
+
+  return (
+    <div className={`overlay${close ? "" : " overlay-standalone"}`}>
+      <div className="overlay-inner">
+        <div className="overlay-header">
+          {close ? <button className="btn btn-ghost btn-small" onClick={close}>← Zurück</button> : <span className="kiosk-badge">▦ Live-Scoring</span>}
+          <span className="overlay-title">{def.label}</span>
+          <span style={{ width: 60 }} />
+        </div>
+
+        <div className="scoreboard">
+          {!matchesReady && <div className="sync-note">🔄 Synchronisiere Spielstand …</div>}
+          <div className="scoreboard-names">
+            <span>{names.heim}</span>
+            <span className="net">┃</span>
+            <span>{names.gast}</span>
+          </div>
+
+          <div className="sets-row">
+            {live.sets.map((s, i) => (
+              <Chip key={i} tone={s.finished ? "done" : i === live.setIndex ? "live" : "default"}>
+                {s.isMTB ? "MTB " : `${i + 1}. Satz `}{setScoreStr(s)}
+              </Chip>
+            ))}
+          </div>
+
+          {!finished ? (
+            <>
+              {!cs.isMTB && (
+                <div className="games-line">
+                  Spiele: <strong>{cs.heimGames}</strong> : <strong>{cs.gastGames}</strong>
+                  {cs.inTB && <span className="tb-note"> (Tiebreak)</span>}
+                </div>
+              )}
+              <div className="points-flip">{pointLabel(live)}</div>
+              <CourtPositionIndicator live={live} serverTeam={serverTeam} heimNear={heimNear} clubNames={{ heim: state.meta.heimName, gast: state.meta.gastName }} />
+              <div className="score-buttons">
+                <button className="btn btn-big btn-heim" onClick={() => point("heim")}>+1 Heim</button>
+                <button className="btn btn-big btn-gast" onClick={() => point("gast")}>+1 Gast</button>
+              </div>
+              <div className="secondary-actions">
+                <button className="btn btn-small btn-ghost" onClick={undo} disabled={!match.history.length}>Rückgängig</button>
+                <button className="btn btn-small btn-ghost" onClick={resetMatch}>Spiel zurücksetzen</button>
+              </div>
+              <div className="wo-actions">
+                <span className="wo-label">Team nicht angetreten:</span>
+                <button className="btn btn-small btn-outline" onClick={() => walkover("heim")}>{state.meta.heimName || "Heim"} (w.o.)</button>
+                <button className="btn btn-small btn-outline" onClick={() => walkover("gast")}>{state.meta.gastName || "Gast"} (w.o.)</button>
+              </div>
+            </>
+          ) : (
+            <div className="finished-panel">
+              <div className="winner-banner">
+                🏆 Sieger: {live.winner === "heim" ? names.heim : names.gast}
+              </div>
+              {!live.wo && (
+                <div className="games-line">Sätze {t.heimSets}:{t.gastSets} · Spiele {t.heimGames}:{t.gastGames}</div>
+              )}
+              <button className="btn btn-small btn-ghost" onClick={resetMatch}>Spiel zurücksetzen</button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {showDeuce && (
+        <div className="deuce-backdrop">
+          <div className="deuce-modal">
+            <div className="deuce-title">40 : 40 – No-Ad</div>
+            <p className="deuce-text">
+              Der <strong>Rückschläger</strong> darf sich jetzt aussuchen, von welcher Seite (Vorteil- oder Rückhandseite)
+              der Aufschläger den nächsten Ball aufschlägt. Dieser Punkt entscheidet das Spiel – es gibt keinen Vorteil.
+            </p>
+            <button className="btn btn-accent btn-block" onClick={() => setShowDeuce(false)}>OK</button>
+          </div>
+        </div>
+      )}
+
+      {showSideChange && (
+        <div className="deuce-backdrop">
+          <div className="deuce-modal">
+            <div className="deuce-title">🔄 Seitenwechsel</div>
+            <p className="deuce-text">
+              Wie im Tennis üblich: Die Spieler wechseln jetzt die Feldseite, bevor es weitergeht.
+            </p>
+            <button className="btn btn-accent btn-block" onClick={() => setShowSideChange(false)}>OK</button>
+          </div>
+        </div>
+      )}
+
+      {needsServeSetup && !finished && (
+        <ServeSetupModal names={names} clubNames={{ heim: state.meta.heimName, gast: state.meta.gastName }} onConfirm={setServeConfig} />
+      )}
+    </div>
+  );
+}
+
+/* ---------- Report Screen ---------- */
+
+function ReportScreen({ state, setState }) {
+  const [signingWho, setSigningWho] = useState(null); // null | "osr" | "heim" | "gast"
+  const [showOsrShare, setShowOsrShare] = useState(false);
+  const signatureFieldFor = (who) => (who === "osr" ? "osrSignature" : who === "heim" ? "heimSignature" : "gastSignature");
+  const saveSignature = (dataUrl) => {
+    setState((s) => ({ ...s, meta: { ...s.meta, [signatureFieldFor(signingWho)]: dataUrl } }));
+    setSigningWho(null);
+  };
+  const osrUrl = `${window.location.href.split("#")[0]}#osr`;
+  const copyOsrLink = async () => {
+    try { await navigator.clipboard.writeText(osrUrl); } catch (e) { /* fall back to visible box below */ }
+    setShowOsrShare((v) => !v);
+  };
+
+  const heimName = state.meta.heimName || "Heimverein";
+  const gastName = state.meta.gastName || "Gastverein";
+
+  const rows = MATCH_DEFS.map((def) => {
+    const m = state.matches[def.id];
+    const names = matchPlayers(state, def);
+    const t = matchTally(m.live);
+    const live = m.live;
+    const af = !live.winner ? autoForfeitSide(state, def) : null;
+    const done = !!live.winner || !!af;
+    const effectiveWinner = live.winner || af;
+    const mpHeim = done ? (effectiveWinner === "heim" ? 2 : 0) : "";
+    const mpGast = done ? (effectiveWinner === "gast" ? 2 : 0) : "";
+    return { def, names, t, live, done, mpHeim, mpGast, autoForfeit: af };
+  });
+
+  const einzelRows = rows.filter((r) => r.def.type === "einzel");
+  const doppelRows = rows.filter((r) => r.def.type === "doppel");
+
+  const sumRows = (list) => {
+    const acc = { mpHeim: 0, mpGast: 0, setsHeim: 0, setsGast: 0, gamesHeim: 0, gamesGast: 0 };
+    list.forEach((r) => {
+      acc.mpHeim += r.mpHeim || 0;
+      acc.mpGast += r.mpGast || 0;
+      acc.setsHeim += r.t.heimSets || 0;
+      acc.setsGast += r.t.gastSets || 0;
+      acc.gamesHeim += r.t.heimGames || 0;
+      acc.gamesGast += r.t.gastGames || 0;
+    });
+    return acc;
+  };
+  const einzelSum = sumRows(einzelRows);
+  const doppelSum = sumRows(doppelRows);
+
+  const motorikPoints = { heim: 0, gast: 0 };
+  const motorikRows = EX_DEFS.map((ex) => {
+    const v = state.motorik[ex.key];
+    const winner = computeExWinner(ex, v);
+    if (winner === "heim") motorikPoints.heim += 2;
+    else if (winner === "gast") motorikPoints.gast += 2;
+    else if (winner === "draw") { motorikPoints.heim += 1; motorikPoints.gast += 1; }
+    return { ...ex, value: v, winner };
+  });
+
+  const gesamt = {
+    mpHeim: doppelSum.mpHeim + einzelSum.mpHeim + motorikPoints.heim,
+    mpGast: doppelSum.mpGast + einzelSum.mpGast + motorikPoints.gast,
+    setsHeim: doppelSum.setsHeim + einzelSum.setsHeim,
+    setsGast: doppelSum.setsGast + einzelSum.setsGast,
+    gamesHeim: doppelSum.gamesHeim + einzelSum.gamesHeim,
+    gamesGast: doppelSum.gamesGast + einzelSum.gamesGast,
+  };
+
+  const allDone = rows.every((r) => r.done) && motorikRows.every((r) => r.winner);
+  let verdict = null;
+  if (allDone) {
+    if (gesamt.mpHeim === gesamt.mpGast) verdict = "Unentschieden";
+    else verdict = `Sieger: ${gesamt.mpHeim > gesamt.mpGast ? heimName : gastName}`;
+  }
+
+  const satzCell = (r, i) => {
+    const s = r.live.sets[i];
+    return <td key={i}>{s ? setScoreStr(s) : "–"}</td>;
+  };
+
+  const OfficialTable = ({ title, teamColLabels, rowsData, sumLabel, sum, extraRows }) => (
+    <table className="official-table">
+      <thead>
+        <tr>
+          <th colSpan={3}>{heimName}</th>
+          <th colSpan={3}>{gastName}</th>
+          <th rowSpan={2}>1. Satz</th>
+          <th rowSpan={2}>2. Satz</th>
+          <th rowSpan={2}>3. Satz</th>
+          <th colSpan={2}>Mp</th>
+          <th colSpan={2}>Sätze</th>
+          <th colSpan={2}>Spiele</th>
+        </tr>
+        <tr>
+          <th>{teamColLabels[0]}</th><th>{teamColLabels[1]}</th><th>Name, Vorname</th>
+          <th>{teamColLabels[0]}</th><th>{teamColLabels[1]}</th><th>Name, Vorname</th>
+          <th>Heim</th><th>Gast</th>
+          <th>Heim</th><th>Gast</th>
+          <th>Heim</th><th>Gast</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rowsData.map((r) => {
+          const st = statusOf(r.live);
+          const dash = st === "pending" && !r.autoForfeit;
+          return (
+            <tr key={r.def.id}>
+              <td>{r.col1heim}</td><td>{r.col2heim || ""}</td><td>{r.names.heim}</td>
+              <td>{r.col1gast}</td><td>{r.col2gast || ""}</td><td>{r.names.gast}</td>
+              {r.autoForfeit ? (
+                <td colSpan={3} className="official-wo-cell">w.o. (zu wenig Spieler)</td>
+              ) : (
+                <>{satzCell(r, 0)}{satzCell(r, 1)}{satzCell(r, 2)}</>
+              )}
+              <td>{r.mpHeim}</td><td>{r.mpGast}</td>
+              <td>{dash ? "–" : r.t.heimSets}</td>
+              <td>{dash ? "–" : r.t.gastSets}</td>
+              <td>{dash ? "–" : r.t.heimGames}</td>
+              <td>{dash ? "–" : r.t.gastGames}</td>
+            </tr>
+          );
+        })}
+        <tr className="official-sum-row">
+          <td colSpan={9}>{sumLabel}</td>
+          <td>{sum.mpHeim}</td><td>{sum.mpGast}</td>
+          <td>{sum.setsHeim}</td><td>{sum.setsGast}</td>
+          <td>{sum.gamesHeim}</td><td>{sum.gamesGast}</td>
+        </tr>
+        {extraRows}
+      </tbody>
+    </table>
+  );
+
+  const einzelData = einzelRows.map((r) => ({ ...r, col1heim: r.def.pos, col1gast: r.def.pos }));
+  const doppelData = doppelRows.map((r) => {
+    const dd = state.doubles[r.def.id];
+    return {
+      ...r,
+      col1heim: dd.heim.join("+"),
+      col2heim: dd.heim.reduce((a, b) => a + b, 0),
+      col1gast: dd.gast.join("+"),
+      col2gast: dd.gast.reduce((a, b) => a + b, 0),
+    };
+  });
+
+  return (
+    <div className="screen">
+      <h2 className="screen-title">Spielbericht</h2>
+
+      <div className="official-sheet">
+        <div className="official-head official-head-row">
+          <div className="official-head-left">
+            {state.meta.saison && <div className="official-saison">{state.meta.saison}</div>}
+            <div className="official-liga">{state.meta.liga || "Liga / Gruppe"}</div>
+            <div className="official-nr">
+              Spielbericht {state.meta.berichtNr && `(Nr. ${state.meta.berichtNr})`} {state.meta.termin && `- Termin ${new Date(state.meta.termin).toLocaleString("de-DE")}`}
+            </div>
+            <div className="official-teams">
+              <strong>{heimName} : {gastName} Ergebnis {gesamt.mpHeim} : {gesamt.mpGast}</strong>
+            </div>
+          </div>
+          <div className="official-brandmark">
+            <div className="official-brand-esb">ESB<span>ENERGIE SÜDBAYERN</span></div>
+            <div className="official-brand-btv">BTV<span>BAYERISCHER TENNIS-VERBAND</span></div>
+          </div>
+        </div>
+
+        <div className="official-table-title">Einzel</div>
+        <OfficialTable
+          teamColLabels={["Nr. laut Meldeliste", "ID-Nr."]}
+          rowsData={einzelData}
+          sumLabel="Einzel-Summe"
+          sum={einzelSum}
+        />
+
+        <div className="official-table-title">Doppel</div>
+        <OfficialTable
+          teamColLabels={["Platzziffer", "Summe"]}
+          rowsData={doppelData}
+          sumLabel="Doppel-Summe"
+          sum={doppelSum}
+          extraRows={
+            <>
+              <tr className="official-sum-row">
+                <td colSpan={9}>Übertrag Einzel-Summe</td>
+                <td>{einzelSum.mpHeim}</td><td>{einzelSum.mpGast}</td>
+                <td>{einzelSum.setsHeim}</td><td>{einzelSum.setsGast}</td>
+                <td>{einzelSum.gamesHeim}</td><td>{einzelSum.gamesGast}</td>
+              </tr>
+              <tr className="official-sum-row">
+                <td colSpan={9}>Motorik-Ergebnis</td>
+                <td>{motorikPoints.heim}</td><td>{motorikPoints.gast}</td>
+                <td>–</td><td>–</td><td>–</td><td>–</td>
+              </tr>
+              <tr className="official-sum-row official-total-row">
+                <td colSpan={9}>Gesamtergebnis</td>
+                <td>{gesamt.mpHeim}</td><td>{gesamt.mpGast}</td>
+                <td>{gesamt.setsHeim}</td><td>{gesamt.setsGast}</td>
+                <td>{gesamt.gamesHeim}</td><td>{gesamt.gamesGast}</td>
+              </tr>
+            </>
+          }
+        />
+
+        <div className="official-signrow">
+          <div className="official-sign-col">
+            {state.meta.heimSignature ? (
+              <img src={state.meta.heimSignature} alt="Unterschrift Heim-Mannschaftsführer" className="sig-image" />
+            ) : (
+              <div className="official-sign-line" />
+            )}
+            <div className="official-sign-label">Unterschrift Heim-Mannschaftsführer</div>
+            <button className="btn btn-small btn-ghost no-print" style={{ marginTop: 6 }} onClick={() => setSigningWho("heim")}>
+              {state.meta.heimSignature ? "✍️ Neu unterschreiben" : "✍️ Jetzt unterschreiben"}
+            </button>
+          </div>
+          <div className="official-sign-col">
+            {state.meta.gastSignature ? (
+              <img src={state.meta.gastSignature} alt="Unterschrift Gast-Mannschaftsführer" className="sig-image" />
+            ) : (
+              <div className="official-sign-line" />
+            )}
+            <div className="official-sign-label">Unterschrift Gast-Mannschaftsführer</div>
+            <button className="btn btn-small btn-ghost no-print" style={{ marginTop: 6 }} onClick={() => setSigningWho("gast")}>
+              {state.meta.gastSignature ? "✍️ Neu unterschreiben" : "✍️ Jetzt unterschreiben"}
+            </button>
+          </div>
+          <div className="official-osr-col">
+            <div className="official-osr-title">Oberschiedsrichter</div>
+            <div className="official-sign-line">{state.meta.oberschiedsrichter}</div>
+            <div className="official-sign-label">Name</div>
+            {state.meta.osrSignature ? (
+              <img src={state.meta.osrSignature} alt="Unterschrift Oberschiedsrichter" className="sig-image" />
+            ) : (
+              <div className="official-sign-line" />
+            )}
+            <div className="official-sign-label">Unterschrift Oberschiedsrichter</div>
+            <button className="btn btn-small btn-ghost no-print" style={{ marginTop: 6 }} onClick={() => setSigningWho("osr")}>
+              {state.meta.osrSignature ? "✍️ Neu unterschreiben" : "✍️ Jetzt unterschreiben"}
+            </button>
+          </div>
+        </div>
+
+        <div className="official-remarks">
+          <div className="official-sign-label">Bemerkungen</div>
+          <div className="official-remarks-box">{state.meta.bemerkungen}</div>
+        </div>
+
+        <div className="official-sponsor-row">
+          <span>Tennis Point</span><span>·</span>
+          <span>klimeo.de</span><span>·</span>
+          <span>Dunlop</span><span>·</span>
+          <span>Tannenhof</span><span>·</span>
+          <span>Generali</span><span>·</span>
+          <span>DVAG</span>
+        </div>
+      </div>
+
+      {signingWho && (
+        <div className="deuce-backdrop no-print">
+          <div className="deuce-modal sigpad-modal">
+            <div className="deuce-title">
+              Unterschrift {signingWho === "osr" ? "Oberschiedsrichter" : signingWho === "heim" ? "Heim-Mannschaftsführer" : "Gast-Mannschaftsführer"}
+            </div>
+            <SignaturePad value={state.meta[signatureFieldFor(signingWho)]} onSave={saveSignature} />
+            <button className="btn btn-small btn-ghost" style={{ marginTop: 8 }} onClick={() => setSigningWho(null)}>Abbrechen</button>
+          </div>
+        </div>
+      )}
+
+      <div className="card no-print">
+        <div className="card-head"><span className="ex-name">Für den Oberschiedsrichter</span></div>
+        <p className="hint" style={{ marginTop: 0 }}>
+          Eigener Link ohne Admin-Passwort — der Oberschiedsrichter kann darüber direkt Namen eintragen und unterschreiben,
+          ohne Zugriff auf den Rest der App.
+        </p>
+        <button className="btn btn-accent btn-block" onClick={copyOsrLink}>🔗 Link / QR-Code für Oberschiedsrichter</button>
+        {showOsrShare && (
+          <>
+            <div className="share-link-box">
+              <input readOnly value={osrUrl} onFocus={(e) => e.target.select()} />
+              <p className="hint" style={{ margin: "4px 2px 0" }}>In die Zwischenablage kopiert (falls nicht: Text oben markieren &amp; kopieren).</p>
+            </div>
+            <QRCodeBox url={osrUrl} />
+          </>
+        )}
+      </div>
+
+      <div className="card total-card no-print">
+        <div className="total-row"><span>Tennis-Punkte (max. 12)</span><span className="total-score">{einzelSum.mpHeim + doppelSum.mpHeim} : {einzelSum.mpGast + doppelSum.mpGast}</span></div>
+        <div className="total-row"><span>Motorik-Punkte (max. 6)</span><span className="total-score">{motorikPoints.heim} : {motorikPoints.gast}</span></div>
+        <div className="total-row total-final"><span>Gesamtergebnis</span><span className="total-score">{gesamt.mpHeim} : {gesamt.mpGast}</span></div>
+        {verdict && <div className="verdict">{verdict}</div>}
+        {!allDone && <div className="hint">Noch nicht alle Spiele bzw. Motorikübungen abgeschlossen.</div>}
+      </div>
+
+      <button className="btn btn-accent btn-block no-print" onClick={() => window.print()}>Bericht drucken / als PDF speichern</button>
+      <p className="hint no-print">Zur offiziellen Eingabe im BTV-Portal die Werte aus diesem Bericht 1:1 übertragen. ID-Nummern der Spieler sind hier absichtlich leer — die trägt das Portal beim Auswählen der Spieler automatisch ein.</p>
+    </div>
+  );
+}
+
+/* ---------- Live Screen (public, read-only overview for parents/coaches) ---------- */
+
+function currentPointVal(live, side) {
+  const cs = live.sets[live.setIndex];
+  if (cs.isMTB || cs.inTB) return String(side === "heim" ? cs.tbHeim : cs.tbGast);
+  return PT_LABEL[live.points[side]];
+}
+
+function BroadcastRow({ name, isServer, sets, currentSetIndex, pointVal, isWinner, side, finished }) {
+  return (
+    <div className={`bc-row bc-row-${side}${isWinner ? " bc-row-winner" : ""}`}>
+      <span className={`bc-accent bc-accent-${side}`} />
+      <span className="bc-serve">{isServer && !finished ? "●" : ""}</span>
+      <span className="bc-name">{name}</span>
+      <span className="bc-sets">
+        {sets.map((v, i) => (
+          <span key={i} className={`bc-set-cell${i === currentSetIndex && !finished ? " bc-set-cell-active" : ""}`}>
+            {v}
+          </span>
+        ))}
+      </span>
+      {!finished && <span className="bc-point">{pointVal}</span>}
+      {isWinner && <span className="bc-trophy">🏆</span>}
+    </div>
+  );
+}
+
+function LiveScreen({ state, openMatch }) {
+  const [showLiveShare, setShowLiveShare] = useState(false);
+  const liveUrl = `${window.location.href.split("#")[0]}#live`;
+  const copyLiveLink = async () => {
+    try { await navigator.clipboard.writeText(liveUrl); } catch (e) { /* fall back to visible box below */ }
+    setShowLiveShare((v) => !v);
+  };
+
+  const tennisTotals = { heim: 0, gast: 0 };
+  MATCH_DEFS.forEach((def) => {
+    const w = state.matches[def.id].live.winner || autoForfeitSide(state, def);
+    if (w === "heim") tennisTotals.heim += 2;
+    else if (w === "gast") tennisTotals.gast += 2;
+  });
+  const motorikPoints = { heim: 0, gast: 0 };
+  EX_DEFS.forEach((ex) => {
+    const w = computeExWinner(ex, state.motorik[ex.key]);
+    if (w === "heim") motorikPoints.heim += 2;
+    else if (w === "gast") motorikPoints.gast += 2;
+    else if (w === "draw") { motorikPoints.heim += 1; motorikPoints.gast += 1; }
+  });
+
+  return (
+    <div className="screen broadcast-screen">
+      <h2 className="screen-title bc-title">📺 Live-Übersicht</h2>
+      <div className="bc-matchup">
+        <span className="bc-matchup-heim">{state.meta.heimName || "Heim"}</span>
+        <span className="bc-matchup-vs">vs</span>
+        <span className="bc-matchup-gast">{state.meta.gastName || "Gast"}</span>
+      </div>
+      <p className="hint bc-subhint">
+        Nur Zuschauen — bearbeitet wird im Tab „Spiele“. Aktualisiert sich automatisch.
+      </p>
+
+      <button className="btn btn-ghost btn-block bc-share-btn" onClick={copyLiveLink}>
+        🔗 Link / QR-Code zum Mitverfolgen
+      </button>
+      {showLiveShare && (
+        <div className="bc-card bc-share-card">
+          <div className="share-link-box">
+            <input readOnly value={liveUrl} onFocus={(e) => e.target.select()} />
+            <p className="hint" style={{ margin: "4px 2px 0", color: "#9FB3A8" }}>
+              In die Zwischenablage kopiert (falls nicht: Text oben markieren &amp; kopieren). Zeigt nur die Live-Übersicht — kein Zugriff auf Bearbeiten oder andere Bereiche.
+            </p>
+          </div>
+          <QRCodeBox url={liveUrl} hint="Mit dem Handy scannen, um die Live-Übersicht zum Zuschauen zu öffnen (nur Ansehen, kein Bearbeiten)." />
+        </div>
+      )}
+
+      {MATCH_DEFS.map((def) => {
+        const m = state.matches[def.id];
+        const names = matchPlayers(state, def);
+        const st = statusOf(m.live);
+        const live = m.live;
+        const finished = !!live.winner;
+        const serverTeam = finished ? null : currentServerTeam(live);
+        const heimSets = live.sets.map((s) => (s.isMTB ? s.tbHeim : s.heimGames));
+        const gastSets = live.sets.map((s) => (s.isMTB ? s.tbGast : s.gastGames));
+        const af = !finished ? autoForfeitSide(state, def) : null;
+
+        return (
+          <div className="bc-card" key={def.id}>
+            <div className="bc-card-head">
+              <span className="bc-match-label">{def.label}</span>
+              {af && <span className="bc-done-tag">W.O.</span>}
+              {!af && st === "live" && <span className="bc-live-tag"><span className="bc-live-dot" /> LIVE</span>}
+              {!af && st === "done" && <span className="bc-done-tag">BEENDET</span>}
+              {!af && st === "pending" && <span className="bc-pending-tag">WARTET</span>}
+            </div>
+
+            {af ? (
+              <div className="bc-wo">w.o. — Sieger: {af === "heim" ? names.heim : names.gast}</div>
+            ) : m.live.wo ? (
+              <div className="bc-wo">w.o. — Sieger: {live.winner === "heim" ? names.heim : names.gast}</div>
+            ) : (
+              <div className="bc-rows">
+                <BroadcastRow
+                  side="heim"
+                  name={names.heim}
+                  isServer={serverTeam === "heim"}
+                  sets={heimSets}
+                  currentSetIndex={live.setIndex}
+                  pointVal={currentPointVal(live, "heim")}
+                  isWinner={live.winner === "heim"}
+                  finished={finished}
+                />
+                <BroadcastRow
+                  side="gast"
+                  name={names.gast}
+                  isServer={serverTeam === "gast"}
+                  sets={gastSets}
+                  currentSetIndex={live.setIndex}
+                  pointVal={currentPointVal(live, "gast")}
+                  isWinner={live.winner === "gast"}
+                  finished={finished}
+                />
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      <div className="card total-card">
+        <div className="total-row"><span>Tennis-Punkte</span><span className="total-score">{tennisTotals.heim} : {tennisTotals.gast}</span></div>
+        <div className="total-row"><span>Motorik-Punkte</span><span className="total-score">{motorikPoints.heim} : {motorikPoints.gast}</span></div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Admin password gate ---------- */
+
+function AdminGate({ onUnlock }) {
+  const [pw, setPw] = useState("");
+  const [error, setError] = useState(false);
+
+  const submit = () => {
+    if (pw === ADMIN_PASSWORD) { setError(false); onUnlock(); }
+    else setError(true);
+  };
+
+  return (
+    <div className="screen">
+      <h2 className="screen-title">Admin-Bereich</h2>
+      <div className="card">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Setup, Motorik und Bericht sind für die Turnierleitung reserviert. Eltern und Trainer punkten live über die Tabs „Live“ und „Spiele“ – dafür ist kein Passwort nötig.
+        </p>
+        <div className="field-row">
+          <label>Admin-Passwort</label>
+          <input
+            type="password"
+            value={pw}
+            onChange={(e) => { setPw(e.target.value); setError(false); }}
+            onKeyDown={(e) => e.key === "Enter" && submit()}
+            placeholder="••••"
+          />
+        </div>
+        {error && <p className="hint" style={{ color: "var(--warn)", marginTop: -4 }}>Falsches Passwort.</p>}
+        <button className="btn btn-accent btn-block" onClick={submit}>Freischalten</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Standalone OSR signature screen (no admin password, own link) ---------- */
+
+function OsrSignScreen({ state, setState }) {
+  const [name, setName] = useState(state.meta.oberschiedsrichter || "");
+  const [signing, setSigning] = useState(!state.meta.osrSignature);
+  const [saved, setSaved] = useState(false);
+
+  const saveSignature = (dataUrl) => {
+    setState((s) => ({ ...s, meta: { ...s.meta, osrSignature: dataUrl, oberschiedsrichter: name } }));
+    setSigning(false);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2500);
+  };
+  const saveNameOnly = () => {
+    setState((s) => ({ ...s, meta: { ...s.meta, oberschiedsrichter: name } }));
+  };
+
+  return (
+    <div className="screen osr-kiosk">
+      <h2 className="screen-title">Oberschiedsrichter</h2>
+      <div className="card">
+        <p className="hint" style={{ marginTop: 0 }}>
+          {state.meta.liga || "Spiel"} {state.meta.heimName && state.meta.gastName && `— ${state.meta.heimName} : ${state.meta.gastName}`}
+          {state.meta.termin && ` · ${new Date(state.meta.termin).toLocaleString("de-DE")}`}
+        </p>
+        <div className="field-row">
+          <label>Name</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} onBlur={saveNameOnly} placeholder="Name des Oberschiedsrichters" />
+        </div>
+      </div>
+
+      <div className="card">
+        {!signing && state.meta.osrSignature ? (
+          <>
+            <img src={state.meta.osrSignature} alt="Unterschrift" className="sig-image sig-image-large" />
+            {saved && <div className="ex-result">✓ Unterschrift gespeichert</div>}
+            <button className="btn btn-small btn-ghost" style={{ marginTop: 10 }} onClick={() => setSigning(true)}>Neu unterschreiben</button>
+          </>
+        ) : (
+          <SignaturePad value={state.meta.osrSignature} onSave={saveSignature} />
+        )}
+      </div>
+      <p className="hint">Diese Ansicht ist speziell für den Oberschiedsrichter gedacht — kein Passwort nötig, kein Zugriff auf andere Bereiche der App.</p>
+    </div>
+  );
+}
+
+/* ---------- Info tab screenshots (base64, illustrative mockups) ---------- */
+
+const IMG_SETUP = "data:image/png;base64,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";
+const IMG_MOTORIK = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAYYAAAHBCAMAAABaA+wDAAAAwFBMVEX////9/f34+vn29/b09/b09/Xx9/r19vXz9vXz9vTy9vPy9PPw9PLw9PHw8vHu8/Du8e/s8e7p8/Dk8err7+3k7Oji6OTg5eLc5eDY6OTd4d/T4NvT2dbN09DB08/BzMa9xcGywruwvLWos62cuKydrqWdqKKTo5uMmZJwopt3kYt9jIRpinx1hn1xgnlsfnVOf3dmeW9kdW1Nc20AcrxJbFtEVk4mYkUVUzUOaz4OTS4MSy0KSispPjUZLyUTKiAMH6OqAAAjgUlEQVR42u2dC3uaShOAgdZzak2jaQFTBUFQISFgIB9oE4H//6++meXuLSbRxPTM9KlBZG/z7szssly4FskZCEcqIAwkhIEwkBAGwkBCGAgDCWEgDCSEgTCQEAbCQEIYCAMJYSAMJIThL8bwB4SUQhgIA2EgDISBMJw7huEKZNHGze4Ct2W2uzu5XyyXi/tJF7/drWoSsgO0u8XycRlaUpZNdgTssLMdU/g2ybO/wx02ppSqckMotTjQru1YlOVoWd1KGa/XAr9fYxmQ5mmSZXuPv43yMjCvp2G138jLA1ku7kblMUV5H41hNcbNyarEoJS1W6jbMEgPxbel0WqCWkjbMNxiQrFW7m1eFCZ8gL+9ZXbgyzFgXR+zWrTkx1XBvcjrlrXyaQ0DArLODkNY1Qh1M1yigh8e2B/oTnYIAl+e8C80shti1w8fWHczCgwP9yG21trE8J39fFWvxjhXC2axvADrgr9m9v0xZDJqXeMfPGCBG9p6LTIMI9izHOe5WlnX6NUwLMWylxQYwvus5spaeR+MAZQHfV5nGwwD9vV7qL5Y9NXcazzWWrsAPG2r3k7omUbRFxsYuugS7ruNaoiP7Ej4fcG8CDqtfqaWRWudl9VwZkUtWJkaUig78oJlt5qU355YYmnJmmZUFWvf5c5wo7yPw3DPNPLANhDDNSqX+RYR7WG4oYBFacMPeaNzDMPCCzQw4EF339eqlcUCcIQW01QRK16IYYoUyn6MJjVZFOEL8wKDXnzHbnPfxFB2mDPCYIWrx77ytArtDMOk8q+3Vd+qFICY8roXrWEY2vJdwaeOATvibXu9WpDzkwzpHgH1Q6ubh4bKSTwchAHyXijlj3dom3YZlyGveyjGuFiA29ptDc3yPhAD6P0W6jXOMVhVy61iIFNXwKhyVWq+WYbP5WRjpIT2tlmtTC8L6LkPq2VHK3BXY4ODMOQePnd0SyxpWFYZMUBwDrF5WiM23NdjQ7O8D8QAQ9UlWG/77Rie7O/bMBQjmdYt63mTIjhcow+DMkZ2Pvh8OYbaAGySjfnQv30vMOBQdbF6vNaeGymdAQYWIFfT1tuc0t3dokxYx7AAz/FYH9dXEwUoSUeq1kOR4wtjw6I+HYHflt2s64xLDFpmjdruecPZxAYcSqyWVwWGWohevChEi4ttseFuAh3/abqOAYPDPYSG1vclRtKc3wsxKDh0XmRTTqU2rbgvMWAKGIppayG6PrY6GwzYpNtWgeH1A1atmIM05w3jx6YuS/0+saMfWBSfvAbDtcg4XBeWW8ijVGIwWJU+BwbZMKQKw/r0bV0Bva3Tt+vsIHAzG7NofVnFmEKkp2KSm026ytFNPp2aHISh1XvI+wSMh1bLe5QwT5Jh6BjG8LNgyKTA0FKbJzPWFVA/mWG26hgKc1g/mYGzrGxG0dBo5sRHtRBZnVywDsPQukBHB6NWoyR9tSzPT93XpxSfDkNxau9h0t2mABA9O7VnSw2VlOawcWoPzzms7tprM4fVE6bvLKsxwcsxZKdKlir0jKfr6pfRp8JAQusNhIGEMBAGwnAeGEgIA2EgIQwkhIEwkBAGwkBCGAgDCWEgDCSE4XNjaJOcRF6Cof1DlOVrkqOLLIs/2gdiaHelvvhV4DmSIwsvfBX7Urd9CIb2Vb9HCE6Hote/aj+PoS3KAinrlCLIYvs5DECBTOHUBrHJgVsPzn2yhdPbQ389UK9h6Eg90tLppSd19mFod/vkkt7DLfXXhktrGH6JpKP3EFHah+G7/JVU9B7Skr/vxtC+oAD9XkH6or0bQ+eaQsP7BIfrzh4MF9ekofeR6wvCQBhI3opBmtyFeK9VeDeRSI8fg0GYho0HFk1pSPX+GHhjsVqThUGDqnfGIIerLRLKpM33xMBul90iy1F+gJ2mNphMkKZR55A6WGlqcoM0DXYdcGnbBv7103TwgrbFadz4/sLk543BeFztkEejhoH3D6XwPIZ+/hthqGxhJwXgMCoxMAqXz0zh+RqGL+Ox8hwGZTz+lzCwuLBc7ZGlXGCYFxREN06SyGxuTtN05sSpzKlREts1awBN6UEcByI6tSg/HPJDcXI9CnYE+22BZWM5cRIhPy2MkzhyOe4LlhIHWo5hGOLXUCsxVMmxSDNOwr4UQC34T4SBD1d7JeQzDDFQ6LGOHBc6rG9O2RGprCS4I25gSJKEbQrwAx5krWEQwuxrJGA2CfxLY4Hrw0YM/znOy9JZOQY9+5qo3EbyQVaLNIrwc/aJMBirZ8Tg8t4bZ0sVEKfdSxVaq9Q3UX8zWf0CuzxRTxoYoksRjhE43rxk6OK12DCDQ2QpRL0hzSHqVedMzJYbzFD5cOwXXc0xDHTo9+M0nW8mHyBkBRjEmgF7Pw8GYfEchoVQOBGbpYAO+iUP2rXNaa5X0HeH9d8ahjFj1wf/Z82DgBFpYAhQ65yWpiFm4+ShBb5H7gx0z4VpEtiGWMYG1faDgGl5PfmA7XVYVdfjyFljmG52fe62uW/KNB0lGQf0LPAH+qpT22ROHdNmu+wGBoVhGHBaknmP9LKJIWIevo8qnDJXMmOfLjs8+sIpzNEkZq5aK88l2kyeFQmlG58MQzMyLNnanLoWHbIOb+QcdlrDLLOGhGf9sYZhkGOAj6mAWrvcZw0lBk7ULXA10At4xXSYVtkHlKrynV3WkGEYfy4MUlPjd9nepqN6kjJNIweLadQTy9hQbBYYAvwrxlsxgE5lDmP4JfcNtPitwABpo74c5bGhwDCciiwcA2KV5/gI+aJq+SSNeRYQNpN/VgyTJgboVXhGz27uneSzaDPBpu4cKTEMqOU4SbZiAG8SBwnDwLGhjLFtpFRgAAIJ5q/CsThkgs6eqRbDQphUGJojpU+J4a7pk8CfGHDE9bqNZBgwCoB+pGreIDXmDSxHnDc49lYMvA0zAoM5JTysxNCcNxQY+nOYZcQh9IwZmyg4nVy1og8zA7XCsDZv+IwYmqHhFvbcWxu7QzpRd2IMzSgw4rhvS1S61RyyklJPjKFxImPBs9mcDM7mqeGrSKnviQHd//1qhV7pgTB8mFMactyXZRYKJuSUPipEo/oFCQT+dh4pRH/QgNWq/3C/OakjeY/p21PjophxY/q2cXY8kDjT2lEBc+5fFNud4PLgipv5iWllDh/uWJvvOxhrsFOUWlJH332c6u1Oxx3803FPZoTVWW84SKiC95PI2UEQeLUrNfZhkP3aQuleDJI1D9zZdgz9Xmfvuhqvb1m1E6ZeMLfFU2C40t7p1N6kckVWw13hqb0pLwx9/SAMqssdiMGdXQnyeDuGfQR2/jJzZF7UToLh8Eq87UT3Y7cyATQMrXGie8plHzPPd7UmBt31PRNq5Skcdxl0NOjh2S+XNhwLGHg4woEfTWvmz9W+49sXOaJB0bMd39Ph96k/1zNlKI4/t3rw03Q+NxyN7XB1VJzhOEVHUD197psdKCbPyBlX6iyqhRj6cAjYshBobmD/a87neoFhPJ/jdXF5s+olQ20dLJHtmLGfqoZYzrReI3fGv8+yDxAQ51BRvcMroL06BlXiJXdcYqiswbaEjg0YdLfPq77ImYEq6L4tfWFQUWuOyhy87g14cEFmoAkKZIwtHg74fy2YxxhOj4f94OlUXvZUTg2Myh7VwBT6gaMIppP3KU9n95RhDkW1AMO/c4OXXQMw2L0L0K2gBr2s6sFM6Dlm2ax6ySZ8F6GQfqDxgpKTLRoy5Go1GnPCFpM7ySKoP58HVnHZxXjDKen2JgYR26oABuxnnD3mTHapkwqGlmvtX8MJwAo4N2sE/s5Bzy9cg+xDpnA472vcFB3W2IZG83UMfN5DAiE3K9v3oXcXOWC1QEOax6MOAcMAwXJZXRkGSKfOy2bVSy5qM7NKA6s3pKqRz1f+9PUYDrskYHbZGzhQ1tjxPN9sYFBsz5s7mxgGuK5zBRgCz3Vdz8zq6g8qDFi6BlwCpYoNoDVssWS5ngdKYn4Lmm/PMQ+78uaZU8KqGVmxxf7h3MycS14tyNBAtSkBYBCZ5iBHNcPABgMAM29WveSiNtllbeynRkMaNdoSJ09ygQy6ET2AesNXq4GhHag8p2N7oWlywxr+RRa5NRRqXsMAGjFKa6hhcEwBMhNKa5hN14LqLgzg523MoapW3RrWMeTWUDSrXnJRm3VrKCraqNERMBx0udiU50Xb4TSX5/pNaxChbW0Mm7MZx88asQGOs1hsGIB3FTcwtM3Bly86mEIRG2oYoMWQGSgjjw198MS8PHgGg6l0BCWzhrJaeWyQWGzYwDBlsaFoVqPkvDaN2FBrSKNGx8BwyMWTMG+YWyJU0HVmTWvgxq5jY4y8sh1br2PosR2XbCA0t6UNDMLU9X0cBeEIBEdKNQyKg2mFbKSEShvacx/sbT+GseMHLgyPMIeiWvlIyWMjpXUM+UipaFa95KI2jZFSrSGNGh0Fw/OXEn+oCH7/bz+ZUcSHc72wvqPwYDT8fwTD2d5m0svcwH8FA910dSYYOLoF8UwwkBAGwkBCGAgDCWEgDCSEgTAQBsJAGJ7FMLy5X/x5Thb3N0PS7ukw/L77c6jc/Sb9ngiD9uclopGCT4LhZRSIw2kw/P7zUiG/dAIMdy/GQJfZHx/DsFLv8AZ1LBd6vs/2TDjcbbHP4kDS8bEx3GzDINX2TH6PYEv+XTvQIh0fG8P9sxgm0uLPvaLVMNyTjo+NYfE8hsnNn8lNHQPdkXh0DLXQO/za7Xa/IQYeNrolhvD3n5+LOoY/pOOTWsNisbhBDL9gY1Fi+DOcjP+QNXx0bPhzw9/9odjwwSOlCej9TwMDjZTecd5wV2H408RA8waaRdM5JTqndDoMdIb1PDDQesN5YKDVt/PAQGvRZ4KBhDAQBhLCQBhICANhIAyEgTAQBsJAGAgDYSAMhOHTYeCHphexlw02xE833skysNnbIW16rMkJMPSz9xOtYdDTDQxe/rq1NB6Tkk+BIQ6iNQxCnG68oShMY9fQTD97GyfJcTF0xiLHuWsY7NQP1jE4+dPGDPbqL5IThOg1DMMkFoOd7+sK2YsOSU6NgY/SGbcbg52m7F25vIkhOw5nPVL6KTBM04jfg8HFV9zik1CLmK2T0k+AQYxTlduNgY+zFzGbaeoqlz3FDAjDKTD4+ELs3RjYy5zZARSpT4hBy16TvguDmqDLYgfMSdknwwBThim3G4ME8wk5j9QJPav1ZBjssrNvwyBG5eTtMoaJXGirNHg9AQY5SbKXWmzF0AEK5VWsksfeMh+bpPOjY1DTuqy9CeoLUKifUBJUG9+fPSWlvycGfE35RtfvRx/7euy/E8MXJZcwjRWl8eYAnK9tvkoIX3VOkfok55QasaFnGOy1aryfpvW7D4uXFDqbaUlejmGoqmoA4x8QYRsGcFN2pu40VHPBF0FG0Uy5/HdgJ+sRhOQ1GKIqFAz2Yagdhyc7qu/RJSn94zAMZkEUJ3Fo0sThWLGBhDAQBhLCQBhICANhIAyEgTAQBsJAGAgDYSAMhIEwkBCGz4xBEOX+9eHSl0XhDcm35kEYePG6K7xk7YYXutciX0veE1689MMLvVoehIHjJenl6qgSwdYru7XwmoL/Wgzi6+7slMQ3JW/kQRg44fp1XZK/Ft6SvJ4HYYDe3H1lOV3xTcmzPK4IQybyazukIL8peS0PwsBx/dc6Fb7/puS1PAgDHP76gt6WnDtCcsJAGAjD341B9NgjYvBuz2gzYyW/LX0Xhm/s3p9I31e59YwJwxZFhGkcRnG0HYNwAIYojNNEIgxvwsAnqYYPWMLnAIAoKrtUWME7pYN5ErKd1l4MM7zwGMxhEMQJmoXgonnpHD+LktjrFRkThr3WEKeRY0CPN6I0dl1pHDk2bAnsGVdzN0hTz9X2Y+CnaSJz/SQNnCQ1sPPbTjgF9cd2mEZ8njFh2ItBYRfPu3zuO2BmJvSx8/pp/OXA2JDGOt6REomiDXnAf0MRuE6SmqKUgJ2QUzpopCQZQVpqSwmT7Mkk4JQOC9ERpLDx3oiMCCeiJ4uNQX5bhEUYDsFgXnLcF+i53IzdYxKlga5nGOYZBukZDDO8IVFFa9BROJ67VL00Amuw8Xs/z5gw7MWQJGyo0+fGaTJ3EENmHBmGyyQN3f4zGPg4DbkBxAbbieacFToQE0LOS2PH9uMiY8KwF4OFz6kKcbTkAw1OjZJoVmHgrDhNnwnR7Pk+GhspxeGY03GsFfTZSCmJ3E6eMWGgWTRhIAyE4bwx0HrDWWCg1bezwEBr0WeB4SOvzBDoyozKHOg6pXPAQFftnQUGuob1PDC8/Yruq9dc0X1FV3STEAbCsAPD78n/DpMJvcT+ZBh+3fzvcLn5RRo+CYbR/14mI1LxCTC8lAJxOAWG3/97uVCAODqGm1dguCElHxlD3Rhufv/zz+8My/CffI/wc1T2/hGZw6kw1EaqN/8ggkzXPNv+nwCfGZfRuDFuJS0fF0NNt//c1KYH4xEzhiosN2cWpOWTYahtg2vimVFMCMM7Y7gRUNs/f6JNAINsYj36KYwIwwdYA06pRyP0S/nunxPC8P6xAYdK//zz8+c/xU8sShCGdx4pgVO6YaPV4fh/Nzc7rIFGSiedNwgCGkM2OEUYEBoyCmsYaN5As2g6p0TGcCoMdIb1PDDQesN5YKDVt/PAQGvRZ4KBhDAQBhLCQBhICANhIAyEgTAQBsJAGAgDYSAMhOHTYeCHphcltYccBeWr6qdrh36zIvacVpGUfHQM/UzlB2AYxPn+WCMtnwBDHEQNDKGWSbPXC3CQp/ZVJ0njHqn5yBg6Y9C228AQbM13nOJDJUFm7GFuJMcP0YdgsNM0e/rRZZo6pOaPwmClafb0o2+5WfAmPiExDmfkok6D4ZuibKpWLx7QbeKjVoFCGct1UvopMCT4MOJotv5gEQjR9kDoW0nq5jRc5bKnmAFhOAmGXMJvzYN62TPr08gsRlSk7NNhcGxNFkQzSjdihDjPpg02n2GYk7JPhyGXL1EWAmoj1iRxVEmxkzQQ2MgpmQqk7hNjwCejN8alapqaxQQCY/UlTKqT0FZ5UvkpMXBx0/kH5TP/o2xL8th7BWKTdH5KDFHzXQtxGSvcNM1MQFBtfMXDlJR+UmtoxOikhiGpPFE/WnslA8lRMejFOaSSSlyaSV3xszSlSH10DMX8uR+nyYBNFwyD/fUK72OkqQd/BsUAd5slkbwUw1BVVZg5w6fKxqFJMNPVsZMUAyU1t4pBksKAVcYT3YxPFM2Uy38HMH71SOlvxxCVyzzpgE0HCnH4BgZOL5d99Ea66JKUfnQM8ixgS52uUs0X8hgh2fBLEtnZ46AH2YGhSROHY8UGEsJAGEgIA2EgIQyEgTAQBsJAGAgDYSAMhIEwEAbCQEIYPjOGt773TXzNe99Eeu9bQ+gtiOeAgd4JehYY6A2554DhI98XzdP7oktjoLennwMG+bUdUpDflLyWB2HguP5rnQrff1PyWh6EAQ5/fUFvS84dITlhIAyE4e/GIHrsCTF4K3q0mbGSpuI+DN/Y9a2Rvq9y6xkThi2KCNM4jOJoOwbhAAxRGKeJRBjehIFPUg0fsIR3VYEoKrtUWOE4Pw3mSXZXtLUXwwwvPAZzGARxgmYhuGheOsfPoiT2ekXGhGGvNcRp5BjQ440ojV1XGkeODVsCYEjjuRukqedq+zHw0zSRuX6SBk6SGtj5bSecgvpjO0wjPs+YMOzFoLCL7F0+9x0wMxP62Hn9NP5yYGxgNz84aSSKNuQB/w1F4DpJaopSAnZCTumgkZJkBGmpLSVMsieT+Ozuw4NiQ4I3Q+TPe4g5ET1ZbAzy+ycswnAIBvOS475Az+Vm7CbDKA10PcMwzzBIz2CY4Q2JKlqDjsLx3KXqpRFYg43f+3nGhGEvhiRhQ50+N06TuYMYMuPIMFwmaej2n8HA403tA4gNthPNOSt0ICaEnJfGju3HRcaEYS8GC59TFeJoyQcanBol0azCwFlxmj4TotnzfTQ2UorDMafjWCvos5FSErmdPGPCQLNowkAYCMN5Y6D1hrPAQKtvZ4GB1qLPAsNHXpkh0JUZlTnQdUrngIGu2jsLDHQN63lgePsV3VevuaL7iq7oJiEMhIEwEAbCQBgIA2EgDISBMBAGwkBCGAgDCWEgDCTHwPD15y+SN8rPr2/EwBOE44Dg34SBKByLw1swfCX9HUu+vgEDGcOpzOFFGEh7xxPCQBhICANhIHlHDIvV/auqdL1aWSdr72S1Gv21GB5WS/jUViv7lBiGq9Vky+7fd+HycXE3zL9CLVar5eL2+hkMd6vFfwKDJEuvq5Ms/3oJBti9WK5KpUItHpdPq1X438Ywuoe+aefWACqy75cLYxQuF3px9M1yeW+tVtB9DejH4QRVEuLxU9TSkFkDbEzCx8XkV7U1wW6+RXfD2+EvOSzVq2Hy3/h9xLAtVndoYDdQjdscw+3qcRKy3Kyqun8HBlmWdcQwWq4WD0toeoFhuXwEHwH9c5Ebh4U+Y4kYJk+rMERdTVZLCZR2Bwpa/CowPIXL1XJYbY3h0EX4sL0dt6uVshfD02KxWhkMA1L4dbdcPYbhpKruX4EhFxttXYLGPg0LDOFvaHooWWV3XawWv6UQMaCGmHOAw8ZTgPMrzHTGMNz+GmeIiq0dTolZRBWIKqfUwBBKMmobcrtbPRqlU6qq+3dhWORbk9IpoTqsX2Aq4yyiolrRJIbDItVvONa+e7xbKY+QrsCgYer6Vg2DFqKUbm60ANobIbqBwc7Mc5LVrcRQVffvig3Q129RRgUGK1PHuMTwVMMQsmN/g04eFuEEOirYSIFhVGIYbWAYM92Ni7gL/bwcDmjlQCvDsCwMrMCwzJAVGIrq/l0Y7lcLGCr+tn7twgD7Q7lwSujphywOL59ur5+WqJqdGH7vGMnePj3VYmyF4TfWZ7xaxwDQQvkXC0O/atX9uzBAzFs+wABoNwYM0cssREPMfVg8hmzQydwYBoudGOD3ZXi70QQV4u8jiLGOASLNYwhhYg3DaPyI+KcY8NWqun/jgDW0d2NgA1a7HLAuHibMRCBK3jEvshuDsWAK3MRQd+81DDhMniw2MOAI7e6XfL/E7bK6/7VzSr+HDNwZTZ7+k6f2Ro/hA7ifKSn/QzEMwRMtQ4N0Tye6CQMJYSAMJKfBQNcpHU1+0lV75yBf6RrW8zMGuqL7YyjwdH/Dx0P4+ubbTEjopivCQPKRGHjS0HsIvx9DXyAVvYcI/X0YOvJXUtF7SEvu7LOGv/kJtOckorTHGlrfr/oUHN4jNPSvvrd2Y2hfyD1S0umlJzeNYQPDFQXp9wjQV3sxtDoXkkxu6dQuSZYuOq19GNrfu5JM9nBaW5Cl7vf2XgzglrpSv0cGcTpT6PWl7ppL2sSAHES5L7YEQnF8BEJL7MviJoVNDOCXAIT08ofMkxzyIH4JIHzfoLAFA8ylLy663d4VydGl1+1eXHQ2KWzDACDAIoAFybGlA5bQ3qbxrRgYCZJTyA5178JA8q5CGAgDCWEgDCSEgTCQEAbCQEIYCAMJYfgvYhh559Igzd3zYycYHJiNFEgt01rbObXeCUNn0C02DTfwHbXVDfpvweDo63vU+fZ2+5c7k7wdQ96Y9lh8AQZF3Y7hMJW8BYOsDPMt3Ve70ug1GBrLGhs6vdiBYWy3ToLhot6Y5+SigWFj70EYLo6AYXCl5FuzXC1O4HlGS7Lmcwt6kjO1HQcOmdqW446hfQ4eOgMM47lvXbSuAsPxZNbpHd932tNg7tls25ZZKteaQ4Yq7oJsIZ3peBbW3NYbSXYVuJkQZAj7zE6rpTi+YwCGq6nn232W2NXqjUGn1B67aBitH9P53MSfazk6GQLbd/XcKbEsiiSIwfAGmUqYcvLalQdAA6fHwNDVtKzTaIGpXJXobVsUbWiL40kt1Zda00BpSXO1whBMxb43Bgx27ls8vdVR2lnXVpQLlhpTZU5p4GudgadBOqPVRfWKvthIsqvAjYQg4ty8HIBiRN/oDOeAwbKlH6bbaeU9omoMYhh7w/bIl1umI/+YBlojx0xs60pyCgyYRZFkanVmjlSzhqJ25QGBchSnNAKHktuuCv0WuhQrU8aPQSC3HBMLH7emqH6oZoUBOuZ0BhiKerhTueFhBj52liI2zNC8Dbs18tssXUu3G0l2FriREF2O10ZVtXT0R6YLDgUSt/1hlrjeGMTgMspGCzTfuvS1Kscgv4RLhmJbaoEBsyiSTG3b7tadUlG76oDjxAY04cqF9sFKWZlK0MaupGCRUJ6ZeUnDqTmlTEtXZQ0Hlu8aOYaB7XlecJWlYhjsueu6nlOma1njRpKdBW4kxD9YCTVomagEYKEEcIwLptOIMtgYxBB4+KPZYh0GWDRyRFECxiLHgFkUSaZzNtKqYchrVx5gHQdDHxjU6q4H7R9Na0DP5+adE/qRhn/tbRigPyp+rgnH7EHqOobZrBbaId2lLzWS7CxwPWHDGhw2JqrCazPYQ2OYNWi51yysYbY2ypADEVnUMBRJptZ4DkOYHxWGvHbVAcfB0Jvp48xFjnX5coAxy1frrnqudMbMVetMZX2o0cDfgqGji60+HGBP8zhhFRgG2Mqhr/3oDJQyneqsJdlV4HpCFht840cWG9SW6LqYWG6J2o8KQ9EYFhtcpd1V+2VsaORYuBqobg1DkQTqr/tKrhJ2ZF672gFHwXBhalrm30Y2DGks6FYwBDKzgYuENXTyMYPFhhdQAceytmGw5+wABYYQLdV1nHGBoTWbQzMUHBVpZbqZsZZkZ4FrCauR0gX+5tgmjpRMz8dhVImhaAwbKemuP7cHrctZPlKq55iPlBx7XMdQJMH6a1B5ppIMWFa7+gHvMYsuGnbk+WR7PnjfAnPp+sM3pX/bFOfsMEhG690xSGq7O3M7hOFjC5Qc8CP91qfEQEInugkDCWEgDCSfA4Pm+drWMcT4aFUsBknl/ErzW974CGXW1xR2y+ErdkfEYAdB4JnttTHZ7oHZfGMtJTvxdUoMktIablOgNjgCBjNg4ldTy7G4uRx6cgyzTlfxx4diuArk98dwtJnDGga2iNTpggz85nzyAzBkH/2gyxYU2VpYtiDWMT3fHmQLYfnq08ALPO9Hsdg19vz5NF+uQwz5shbux/NOrb49n8+u2Aqda2/gK0psOabtumqrWrPD00njVrnC15p5Pp7gLxfgikU3LLPYxmLxD56qzRfnGuUWK2xb181EF7WQVxeckub7ntd7bwz9uV5TSmkNpje4NOciW2Lq5w5TRGvIF7tw35VSWUOxrKX6SlsLZq2eZ/ZEG5eGQHczazcGV2Lnrqs1u+zkarHC1xpLbRXqUCzAif4YyskwlNusbgpbiygW5xrlFits29bNLmy70yqri7Hh/a3Bn88Dq70Ng6fjOTg9W2LK3RRiKBa75EAX606pWNaycgPT0KkM/WyFbvMCiqpEo3J2bM3OyTxTscKX1dMoF+CKRTcss9xGgYLbUOliOaJebrnCtm3dzHJFNvjIqvsxGCxJUpzZNgwBRmPQEfPVue9HDOVil2bjCeMSQ7GsZaNjms1aho/H+SI7GZ5fn6F5IM4aBj0bnjTW7IzagpvheJ4/Lb8Xi25YZrmNovqXqn9VLs7Vyy1X2LasmxlzdqapqO7HYMDepgfQxcXMu26xhjUMtUj3Qw/EH6U1zMpOyfIttFNXRyNg1krEtpdrdoU15Gof4Vlxu8Kw0xranoZlV9ZQlVuusG2um2m5eyqq+0EYOhd922FKz1ayMHCxD9Pt/2CxYQ1DsdjVV7vQhqtsbQp+L5a1ithw5ZliW9Z2YShLLDCUa3ZFbCjVfgF5Vxh2xQYMDLhWVizONcotVtg21s2UQMexUresLlbFcCBYDKfvO29g539VN1vJYmth7OMCRkrOsLWJIV/sGmSrWNnaVD5qyXbgSAna0LfmuOa/C0NRYoGhWrOz8guJMrX/sHDFr8LARkfoeYqRkumU4YYByRfnGuUWK2wb62ZWNm+An/LqYlVEaMmVFnz+kxm2cdr8TXv7Np1Tqma3lx39+Jd91sxIailzbXObMKwNgtkM6WRioPNob24TBhLCQBhICANhICEMhIGEMBAGEsJAGEgIA2EgIQyEgYQwEAYSwvAflP8DaQXSiBlkWU0AAAAASUVORK5CYII=";
+const IMG_SPIELE = "data:image/png;base64,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";
+const IMG_LIVE_SCORING = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAYYAAAHKCAMAAAAwxBzAAAAAwFBMVEX////6+/vw9fXj8frs6efb5ubi1te70tO0vry3q6Z+tMV0o516kYdFjItzgXtzgXlJgX12gJ1zgHlygHhyf3h+f2VxgHdxf3lxf3dwf3dwf3Y4f3hyfnhveplvfnZvfXZufXVufHZufHVtfHRtfHNtdWRse3Nse3JsenNrenJrenFreXRqeXFpeHBod281c2UOesAOaz4Hdr4AcrzDQjXAOStZX0dWVzZQYHVOW4EoYVoqTTwfNSsTKiAKSisBVYxdsbkOAAAVs0lEQVR42u3dC1ujRhcHcAaZzBCITVtr9fWp2tXVjboh7rbpVkj9/t/qnTMzXIZcjAaSiP/zPO2acAmcH3MDQryfEHsQHlIABgQYwIAAAxgQYAADAgxgQIABDAgwgAEBBjAgwAAGBBjAgNgawy+IxuN1DMjXti28VQi/IhqMVRDeEoN82SNEI1G3WM1QGhQrOEFsHI7GIgdvDiE3ODk5pkAOmwibSkdiGUOuQAYm//9DNBZG48RA1B08V0EjaAO14KmNc8RGkedRW2gJC7GIwSgQAhnY7F8gGgrroSU0hOPg1RWUlkL4PZY8YB6iwWABl/HvBHF8XHfw6gq6JIQBstZOBKEuEXWHCoNSUOVFIcQc6WoveKwgqGLSDi5DReE88pGrNsOPzuccvIrCkVFAotoO43BUcSgZrEKMstB+eYhzB4fBFAatcIp2YRvtw6lxKIpDwaAaBqVwESJH24jwQjlQ8+Ay2MJwcY6e6nb6recXRXHIGcrCcBkjQ9uJ+NIpDl6lMJxffJJI0HZCfro4rxSHkoEKwyUa6G010pe6ONQYjk6oZfh0iaZhW43D5SdqHXStZBh003B8ogrDpyuczdtSsKtPqjhQraQbB8+pk66Rn23FtVMrGYYjYrj4dAWG7TFcUa1kRtIFw4nuJ13dID3bipsr3Vc6qTFQnfQuGRh7pwxUK9UYdAt9eX37Djvg4/G7PBl5qxsH00YTwy9g2DXDLzWGERi2FaM5BtNfpRa6zhDPZrGqfcez2bTY13A2C9fNUDrL0nv3BAmfzcb1GdVszuv1P+J1DIt2p/Zx9U1RHzBNZ+n0sEeXCeIVJ3tes9HEcGO7SrrHug6Du9nrfpz/Y2bD3y+GusJqhtDuRLh407fH8LW62YwFUq515kntbRZLER5mLzAwT0q5PYavdYXVDNksC4UMp3LHDPd2s+lj4nQW2I+T02yW6iumwTjL/hSz2b2zqHpjJmya1YrU3FkaM7MvMs3S0EiJcZbafQ/U2jPa3VYZ8t3xgkP6uNB+XJRm094CBn82+1EuTaHKU49q2zE3s4up2bHqWtzdDdXuyjUYjlYwZLNZ6ltt9XfOQFNSPYmltHFpnSF2Dp2pnpve4XpeU8rHZvVm3wNaXabfb5Gh2B2eFlkN7SalbGFpUHnsOQwy0wtkPZrdbPTv7lqc3c103nrLGI5KBnN+dSGDWk1QVJJh0PN1jrg+pkLaKPW/KedzDGO9h8LuKdVj/nQ247SkWg1ts54nlYEw+65eSM9Xf/ptMhS7oz7u0O+llB86wEL6Uy5tG7L8yDYVV8q9XjabaoZYH0DcWYu7u9I2SosY7PjNc85l3C3abruG0G6EzlGkEjidqg+amvR5cjWDHx6Ox3oTCVAXD7WNY5tuve/qoFFr1PO0ymB3J9Ndh9geSKce7VK4sKf0mQ7m2UPB0DP7rt5lxMD0WkJnLc7upnqRh9pq75yzGS8yTPMNVx8TFQxx3gtKKaE9ne+FlRIL8+NFh8z3hZoF+l8vZ2D5GttlyHeH6fQU5bmoCecZ1LyCdpflmy6LLQ3s7PW1zO1ub75xfyVDLO2G57nJS0NYHvZFaaj0ooStD/Umqtn/9Glt+eFRlIZetTRso6eU745bGlwGJqUoena2A6VyXpaGcdmxUu8XpSEss1PZ3WYYtH5UY6Bk9uh+zNC0DT3TNshKHfjZdFhP6S29nX5eSqttQ8lAtRjzfPmj5Q6r3R1qGwKRtw0uQ1B2j7zZj1BQach0r4mad2bq/yA81AzjQGS2bQjLuqKyuw0x6A0PXQZdK2W6X1P0lL64DNREmYhoM7Ix9ShkvadUMlBJpv5F1vbwzeyO21NawVDshOkXqV2Qdt/HenbdcvzurMXd3aYYTCfJZTDjhind/E3jhisDEFU7Ziz8Qb3nL1I1YjRSiItSKlVfw44bSgYaN2RZOpZtM5jdqY0bHAZR+Xx5OM3n83pTnVozbkgPhZ5dvZnl44b8/+7ubsywVghVOwZTvX3T2dZvdGrj1F6sO3PrxKIWfb1onGFcjFVYlrIuMEwz/v4YQhq5T3d18+tuT3TvEQOuN4Dh3QYYwIAAAxgQYAADAgxgQIABDEuDR2dPj83F01m04Owb8w+aDZ91ioEPH5uPIW8ZoVWIHTCIx3ZCOAoH7QTrCkNbCo5DWwptOWydgT+2F7x9hZYcts4wbJFhmH+I3yKD3wWGsjDQPUyOSSJ8xkWi/qIbJtRru0gwsH/kM/Y9b1CsxPf1Ik5xKAqDGDw/P/erSexPnp8H+h01RajXzyYGE/Nvv1ywX11Lv93isG2GqEyZ8F0G7nHBvTNTyTNiUS89IeRQqGBeUBzzrGDwuAw8v1hFVCsM/eeBm0KVdfXOgHJrct6nGdR7/Z8HA6Iw86qJ5XLOi5aKw7YZzpy8OwyU+kc6shPGuPEa6vcedQFh+aJclaMBpVw19kNdaIqVnpkPKTIm+MGBybqNSKdT6L9UbnMrO7WYNXqOKPtUZET5Io8OMCTLGXxPRGfmmBaR6VAVDAnz4rweCh5LBprksWIomNQYTG4jpzREfW7qJKFrpQrD4HlSLNM3BPRf8aJDDI/LGfQAjCf0fpQYsJzhiXt9O9dALaQZkmhoJ0WVEjXHoBLPKy//sA0AHd7R889Vhsqcz3nm+8rsuYMMK0oDZZartlkTmOTmDKIcbQhfqEaF56lPHIX50lBTODjgIjKH+M95TWMZRCXTTgHoYmmYbxuS2L4Xm/oob2d5ySArHSw7RlNasVp66LO4ssZ626AO/oFW6OfNrTD1EX8uO0aGgVdb4aI5oNLQxbahPHQjqRoDmaisS1uh+NQfinSPSQgtZhjUcIDeKTumZdug+k9qwnB5T0l1ggYRZZ4Xb6js2wkTDWAYBvqdQa2nRIWgiz0lXuvjD0uGiMYNEaX+SR/1MmeI6hVayWAmDJaNG8yoYFIy6IHEQNh2W+i3DUM+frClxvZddV0kJp0bN2AUjXNKOKeEM6y43oDrDbj6hmvRuBaNAAMYEGAAAwIMYECAAQwIMIABAQYwIMAABgQYwLBfDGKaZelV9dJOMKs+5zpd8jQ5Ps7M87/XngCGFQqzaShj5wHjfipeZrAPoo3XnwCGFTE2D+1bfg1yCcOfs1nIp/oZtWtOAMOK+FE8+vF+Sk/j57ZS8g/TmS4jmkGqmuuwejMX088vl/PPD106AQyrIp7F9ri9VwbBD1U4NMM0C+VXenhrqp9rO5Zh9lXNlB2amXuz2Z/6keZf7HqWTgDDOuF/ns1S+j0d757qkSALNYPUv8wxfTAMUyoycqZKShbnTQrV/pWHCi+dAIb1ohf/yDKV9Ht6sLo3PdQMsX5B/1cMvqlhqh2opdkGw9uDZ1NqG3RbMdYM41mmgp59qhjoh0LoVaW6X1r3oFLapL+U5aUhNaXhMO1RcFsaIv3KRxPdWkEwvdKU2gb6gYJZ3jb0Kh3WdIwOa8sd1jSS4ZSO3fs0lTIte0qRlHFc9pRk+CMoW+K5UdrSCWBYaxR9n2bmx8fup2Fl3MBiNW74Ie24QZ/xoB89y/ulc+cslk4Aw+vifup1MsAABjC8U4auBhjAgAADGBBgAAMCDGBAgAEMiLYYmLx5+g/x5ni6kWxzBgmDzSXkhgwsRhKbiJhtxACFphw2YZDIX1Mh387A0C401z6wNzOgMLRXHF7BcIPkNRdXb2ZAndRkrfRmBuSuyQADGBBgAAMCDGBAgAEMCDCA4ZWRJsM4jqL4cLjiTMnTkGYZPoGhDYYkktVvADIRL0r0U1TMxKOmJNJhJPxl17KWfCGuowzRotsN0nq+Que8PIsaIHD1wbAguHu8P/EXZnhDDF+6sgsG+qZsVcF/YQYwtMTgXOLji2bogaF5hkAIKZyWOl0AFYiyRd309hAw1Bh4NLQ5f6p8UXxcVEnMuTuquLfHf9qcgct49AKDL93oKEOSVF/dzB+cxUXz09pRull3KZGx/uSnFxh6/7Ub+zmKFnNJzqshUW8qgkY+EAwrW+w8K6dzaSpmGS5byXk+RwqGt0VYz7GcuyEkebFWAsOmkdc4fv0NNr/lYhsMPBKBzwJum5KPwSDnjvS8Y8TLmYI6VZsM1aF7/BEY0iTmcwd6suDQ5y/duNYSg6qhnjrNsHwMnSwYVhe9qWTbDJ6ffBgGJiv7Ol7AIHfHsOmg8R0xiLiSvcNVDMPtMzTec9rjSsmP55MRLmA4b5vBl9HXJEni6tcFrz5O21Ae+ytLw3hpa29jo1G0H5aVXuXHCkR3GTiFv8jhTW1DIycz0iVdaZZ2lsHu+LBS+Icb9JQaYahvHHvxHEp3hm9JUCv7bxo3tMFQFoe4+wxl2tnyUbT/0ii6FYaomRPs74OhPNSTZeeU0kYbSzCsLvvDt59hbYUh/EiVUtn+WobjN1xvaKTDurSYnn8Ahqe5L5y+4epbE8M3OXJfX7X0Tdj9YPAjJ1Vpr95Ez42Z17gW3QSD8HrVL4AnxaiGd3H4ps8h5f3/NA7mx9HlnRmHWoG9/MyItRgSE0WlF9k30rJy9CNb7z1F5YAm6igDpZQLKYVzW9hwvotC9ykF69yntA5DuuwBX+dOG0Vb5mxY8F93GRq+a69BhrkYfyQG8eI9rE+7YWj8Oug+M9TujXvtHd2tMfjn/3WTYdFvTIm5U3ap+7wbFq5eaRMMifRf/t5Fd8YNSex+2acXLTxv+hQWcwUvftunCQYVw0iw6oa1gLBXw7c0GcdxFMfHK7/Y9jTewXffnoaHtGU3SVsfgG+C7kWAAQwIMIABAQYwIMAABgQYwIAAw8dgwDO6G4y3P6MbT6xvMN7+xHr8fkOD8fbfb8CvmTRYJ73910xQHForDPilq53ERr90hd99a0phs999w68gNtIubPoriPpmkStIbGJw1cRvgiL24xdyEWAAAwIMYECAAQxgAAMYwAAGMIABDAgwgAEBBjAgwAAGBBjAgAADGBBgAAMCDGBAgAEMCDCAAQEGMCDAAIZ3EayV6DYDCxoORr8L0XBEKrrM4P/1d9MRel74T9MxjTvNEP79Phj++dxphr/eC8MUDPvA8A8YwAAGMIABDGAAAxjAAAYwgAEMYAADGMAABjCAwb2K8BkMu2f4zWNTMOycQXpeDIZdM0wD3+Ng2DVDGKp5fwPDjhn458+eJ8GwW4bfev/801u7kQZDSwwy6PWCtYsOGNphmAZTFYEXgGGXDKGea+1GGgytMIQsUGOG31St5IdgwDklMIABDGAAAxjAAAYwgAEMYAADGMAABjCAAQxgAAMYwAAGMIChoQiaD9/z/BZWyzvMwHvNR6BwW1it12GG/r/Nh2zl8UB/gQEMYAADGMAABjCAAQxgAAMYwAAGMIABDGAAAxjAAAYwgGFThj90gGG3DH8IzwtE4PGfwbDTSsnz5L//cs8Hw+4ZVHr/AMPOGQRKw84ZeF+wHtqGnTNI5kv0lHZfKansojTsQdvgexwMu2for1kcwNAOw8/c83xVEgJvreYBDDinBAYwgAEMYAADGMAABjCAAQxgAAMYwAAGMIABDGAAAxi2z/DHe2EIO83QgkMbDH+FrNsMzYdoPWOdY0CAAQwIMIABAQYwIMAABgQYwIAAAxgQYAADAgxgQIABDAgwgAHRWQYeJY+bRxLN/xQV708m3zePyaTPu87AosemInLvjGH9781Fv9P3KXls+NhcDKu5YpPvTcaEdZkhemwyqr9U2P/ebPQ7zMAfm42yDuffmw7eXYaoYYaotcLQenHYJUPSMENSrHnSOMOkuwyPTQcY9ovhe/MBBjCAAQxgAAMYwAAGMIABDGAAAxjAUL9uI+lscuyeqtMTPM9X//h2MVFM8fP5I3PafBnDpM+ZWq7+ns8ORN+cfvrGyjNRegIXfec8UufPKZ3lJ1qlfvO1DCK/0jDHMCmuRZuz1GLhiWtevuw7U8SHYog9mV8ukJF4gUHS8xgih4FOl595ixj6ReL7oi9cBsr1gX62g2EQtNRBfr1TqAm+YqBP8/TL/sdhMAViJcPQnaLe8Wlxqf5ZxWDyXnk1UfOLb6Zusrk/EKZWmtgZv9naKq+swLCKQdIkpv55FUO/dtNAn56jYmolxXBQmQSGytU0p21wKqUz5kWRx85ezcBN62EaENW2TFSJ8L/Zq86M26b7QzAIJ81vYkikJ7gnkxpDuWa2iMG2FNxeqZvodkHY4sCr17PBoJNNraR0m+gzh2FIi5+9ksGWhpzB1EfFLKZ/a7KPSmmttiGhzip/rDN8U5WNqpQmRad1SdvAdZKLu1+KBoOKRB8Mr2CIqJpKXtlTYranpBkqnVE1Zut/s9XWB2VIBgO183IwWDFuiChchkf7xgoGNQAQuvs/qY8bfEpy3wwNzNhi4vlC//lRK6Xibq9k9Sg6qDHYWVcxlAf73Cha1UMHNtMTelXMK76DoXWG7xNxwMw5JTVV91R1FUW1Ej9gPjd104dhwBlWMIABDGAAAxjAAAYwgAEMYAADGMAABjCAAQx54Jugrwh8L3ovGPCUgL1gwDMz9oIBT5DZDwY8T2kvGPB0sf1gwLP29oQBsYrhlBhGSM+2YkQMpy7D0TEYdsNwfFQy/AqG3TH8CgYwgGEFA0N+thNsnkG10ccnp+eXl9ejAAnaTgSj68vL89OTY2qh6wy3PSRoO9G7rTH8VGWQSNB2QlYZfsoZTjTD1U2MBG0n4psrzXBSYzBnM27QOGynabhxzmXkDLardH0bIkXbiPD2ujqItgy6x6obh1uOHLUf/NY0DXl/1TDkbTSNHGIfWWo7/JhGDZWOEjFUzrGq4nCHVrr99vlOFYbK+dWCIa+VVHG4Q3louyzcjUw/qaiTKgy6r3R5fTN6iNE+tNkuxA+jGyoMqp9UY6BaSRcH6izdjb6E6Le21VMNv4zuqJukC8OJbRo0Q1EcTi+oWrq9exh9iWUvwHm+RoMFPRl/GT3c3VKVRC1DURhyhrw4GIfRw+jh4auKMaKxoHw+qMSOjIJTGEoGUxyoeVD10uiOIAwFopmgfKqiMFI1EjUMRWEoGUxxsA6qPFzfaIiRpkA0E5ROhXBzbcvCiRlBa4UKQ+nwyUCM7u70wogG4uHh7m5kED6VCjUG63BSOCgIJXF7a9Zxh9ggTA5VMm+uqSTkCicVhZyh6qAhVIlQEtc3iIZCJfPqivKqEOYUqgx5vaQKBLUQaglVKBANxaXJ6MW5KgpljVRnKB00BElc6CURzYRK5gUZaIS6QslQOKjyoiGUBFkgmgnK5qlGoAqpplBhsA4aQksQhY5zxEaR5/F/2sAguApVBu1gIIyEtkA0FJRPbZAjVBQchsKBII5ooWOjgdg0bCqPDMKcgstgIQqJI8OB2DSKZBYGv7h5rzFYByPhaCA2ijyfeX5/Ws1QkSgtEE1Emdf5nC9gqEIgmo9FGf8/Cb0dx1v0ZcoAAAAASUVORK5CYII=";
+const IMG_LIVE_UEBERSICHT = "data:image/png;base64,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";
+const IMG_BERICHT = "data:image/png;base64,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";
+
+/* ---------- Info / help tab (public, step-by-step guide) ---------- */
+
+function InfoScreen() {
+  return (
+    <div className="screen info-screen">
+      <h2 className="screen-title">ℹ️ Anleitung</h2>
+      <p className="hint" style={{ marginTop: -6 }}>
+        Kurzanleitung direkt in der App. Als PDF zum Ausdrucken/Weitergeben gibt es die gleiche
+        Anleitung separat.
+      </p>
+
+      <div className="card info-overview">
+        <table className="info-overview-table">
+          <thead><tr><th>Tab</th><th>Zugriff</th><th>Wofür</th></tr></thead>
+          <tbody>
+            <tr><td>Live</td><td>Alle</td><td>Nur zuschauen</td></tr>
+            <tr><td>Spiele</td><td>Alle</td><td>Live punkten</td></tr>
+            <tr><td>Setup</td><td>🔒 Admin</td><td>Vereine, Spieler, Aufstellung</td></tr>
+            <tr><td>Motorik</td><td>🔒 Admin</td><td>Motorik-Ergebnisse</td></tr>
+            <tr><td>Bericht</td><td>🔒 Admin</td><td>Formular, Unterschriften, Druck</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 className="info-section-title">1. Vor dem Spieltag: Setup</h3>
+      <div className="card info-card">
+        <img className="info-shot" src={IMG_SETUP} alt="Setup-Bildschirm" />
+        <ol className="info-steps">
+          <li>Im 🔒-Tab <strong>Setup</strong> (Passwort nötig) Vereinsnamen für Heim &amp; Gast eintragen.</li>
+          <li>Für jede Position (1–8) den Spielernamen eintragen — oder komplette Meldeliste (bis 30 Namen) einfügen und per Dropdown zuordnen.</li>
+          <li>Reihenfolge bei Bedarf mit ↑ / ↓ anpassen.</li>
+        </ol>
+        <div className="info-hint">💡 Nur 3 Spieler? Mit "– Spieler" auf 3 reduzieren — Position-4-Spiele werden automatisch als w.o. gewertet.</div>
+      </div>
+
+      <h3 className="info-section-title">2. Motorik-Wettkampf</h3>
+      <div className="card info-card">
+        <img className="info-shot" src={IMG_MOTORIK} alt="Motorik-Bildschirm" />
+        <ol className="info-steps">
+          <li>Im 🔒-Tab <strong>Motorik</strong>: Stoppuhr starten/stoppen für Zeit-Übungen.</li>
+          <li>Oder direkt "Heim" / "Gleich" / "Gast" antippen, um den Sieger unabhängig von der Zeit festzulegen.</li>
+        </ol>
+        <div className="info-hint">💡 Punkte (2 für Sieger, je 1 bei Gleichstand) werden automatisch berechnet.</div>
+      </div>
+
+      <h3 className="info-section-title">3. Live Punkte erfassen</h3>
+      <div className="card info-card">
+        <img className="info-shot" src={IMG_SPIELE} alt="Spiele-Liste" />
+        <ol className="info-steps">
+          <li>Im Tab <strong>Spiele</strong> ein Match antippen → "Spiel starten".</li>
+          <li>Einmalig festlegen: wer schlägt zuerst auf, auf welcher Seite steht Heim.</li>
+        </ol>
+      </div>
+      <div className="card info-card">
+        <img className="info-shot" src={IMG_LIVE_SCORING} alt="Live-Punkteerfassung" />
+        <ol className="info-steps" start="3">
+          <li>Mit "+1 Heim" / "+1 Gast" punkten. Die Grafik zeigt, wer aufschlägt (A) / returniert (R) — bei Bedarf "Seiten tauschen" bzw. "Ansicht drehen".</li>
+          <li>Bei 40:40 und bei Seitenwechseln erscheinen automatisch Hinweis-Popups.</li>
+          <li>"Rückgängig" für den letzten Punkt, "Spiel zurücksetzen" für einen kompletten Neustart des Matches.</li>
+        </ol>
+        <div className="info-hint">⚠️ Team nicht angetreten? Über "Team nicht angetreten" direkt als w.o. werten.</div>
+      </div>
+
+      <h3 className="info-section-title">4. Zuschauen: Live-Übersicht</h3>
+      <div className="card info-card">
+        <img className="info-shot" src={IMG_LIVE_UEBERSICHT} alt="Live-Übersicht" />
+        <ol className="info-steps">
+          <li>Tab <strong>Live</strong>: alle sehen den Stand im Broadcast-Stil, ohne Passwort, nur Ansehen.</li>
+          <li>Über "🔗 Link / QR-Code zum Mitverfolgen" teilen (WhatsApp, Aushang zum Scannen, ...).</li>
+        </ol>
+        <div className="info-hint">💡 Jedes Match hat im Spiele-Tab auch einen eigenen Link/QR-Code — führt direkt zu genau diesem einen Spiel, ohne Zugriff auf den Rest der App.</div>
+      </div>
+
+      <h3 className="info-section-title">5. Nach dem Spiel: Bericht</h3>
+      <div className="card info-card">
+        <img className="info-shot" src={IMG_BERICHT} alt="Bericht im BTV-Format" />
+        <ol className="info-steps">
+          <li>Tab <strong>Bericht</strong>: automatisch ausgefülltes Formular im BTV-Layout.</li>
+          <li>Oberschiedsrichter sowie Heim-/Gast-Mannschaftsführer unterschreiben direkt am Bildschirm ("✍️ Jetzt unterschreiben").</li>
+          <li>"Bericht drucken / als PDF speichern" — Werte 1:1 ins BTV-Portal übertragen.</li>
+        </ol>
+      </div>
+
+      <h3 className="info-section-title">Häufige Fragen</h3>
+      <div className="card info-card">
+        <div className="info-faq"><strong>Wie komme ich in den Admin-Bereich?</strong><br />Auf einen 🔒-Tab tippen und Passwort eingeben. Bleibt angemeldet, bis "Admin abmelden" (im Setup-Tab) angetippt wird.</div>
+        <div className="info-faq"><strong>Neuer Spieltag, alte Daten stören?</strong><br />Setup-Tab ganz unten: "⚠️ Alles zurücksetzen" (doppelte Sicherheitsabfrage, gilt für alle Geräte).</div>
+        <div className="info-faq"><strong>Nur ein einzelnes Spiel ist falsch?</strong><br />Im Spiele-Tab direkt am Match "Spiel zurücksetzen".</div>
+      </div>
+
+      <p className="hint" style={{ textAlign: "center", marginTop: 16 }}>U9 Kleinfeld Live-Tracker · Bayerischer Tennis-Verband</p>
+    </div>
+  );
+}
+
+/* ---------- App shell ---------- */
+
+
+function App() {
+  const [state, setState] = useState(defaultState());
+  const [screen, setScreen] = useState("live");
+  const [activeMatch, setActiveMatch] = useState(null);
+  const [kioskMatch, setKioskMatch] = useState(null);
+  const [osrKiosk, setOsrKiosk] = useState(false);
+  const [liveKiosk, setLiveKiosk] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(loadAdminAuth());
+  const [matchesReady, setMatchesReady] = useState(false);
+  const matchesSeenRef = useRef(new Set());
+
+  const ADMIN_SCREENS = ["setup", "motorik", "report"];
+
+  // live sync: subscribe once to every shared slice + every match. Firebase
+  // fires the callback immediately with the current value and again every
+  // time ANY device changes that path — no polling needed, and every
+  // screen (Live, Spiele, ...) always reflects what everyone else is doing.
+  useEffect(() => {
+    const base = defaultState();
+    const unsubs = [];
+
+    unsubs.push(subscribeShared(SHARED_KEYS.meta, (v) => {
+      setState((s) => ({ ...s, meta: { ...base.meta, ...(v || {}) } }));
+    }));
+    unsubs.push(subscribeShared(SHARED_KEYS.players, (v) => {
+      setState((s) => ({
+        ...s,
+        players: {
+          heim: Array.isArray(v && v.heim) && v.heim.length ? v.heim : base.players.heim,
+          gast: Array.isArray(v && v.gast) && v.gast.length ? v.gast : base.players.gast,
+        },
+      }));
+    }));
+    unsubs.push(subscribeShared(SHARED_KEYS.clubs, (v) => {
+      setState((s) => ({ ...s, clubs: Array.isArray(v) ? v : base.clubs }));
+    }));
+    unsubs.push(subscribeShared(SHARED_KEYS.playerPool, (v) => {
+      setState((s) => ({
+        ...s,
+        playerPool: {
+          heim: Array.isArray(v && v.heim) ? v.heim : base.playerPool.heim,
+          gast: Array.isArray(v && v.gast) ? v.gast : base.playerPool.gast,
+        },
+      }));
+    }));
+    unsubs.push(subscribeShared(SHARED_KEYS.motorik, (v) => {
+      const motorik = {};
+      EX_DEFS.forEach((ex) => {
+        const m = (v && v[ex.key]) || {};
+        motorik[ex.key] = { heim: m.heim ?? "", gast: m.gast ?? "", manualWinner: m.manualWinner ?? null };
+      });
+      setState((s) => ({ ...s, motorik }));
+    }));
+    unsubs.push(subscribeShared(SHARED_KEYS.doubles, (v) => {
+      setState((s) => ({ ...s, doubles: { ...base.doubles, ...(v || {}) } }));
+    }));
+    MATCH_DEFS.forEach((d) => {
+      unsubs.push(subscribeShared(matchKey(d.id), (v) => {
+        setState((s) => ({
+          ...s,
+          matches: { ...s.matches, [d.id]: v ? normalizeMatch(v) : base.matches[d.id] },
+        }));
+        matchesSeenRef.current.add(d.id);
+        if (matchesSeenRef.current.size === MATCH_DEFS.length) setMatchesReady(true);
+      }));
+    });
+
+    setLoaded(true);
+
+    const hash = window.location.hash || "";
+    if (/^#osr\b/i.test(hash)) {
+      setOsrKiosk(true);
+    } else if (/^#live\b/i.test(hash)) {
+      setLiveKiosk(true);
+    } else {
+      const m = hash.match(/match=([a-z0-9]+)/i);
+      if (m && MATCH_DEFS.some((d) => d.id === m[1])) {
+        setKioskMatch(m[1]);
+      }
+    }
+
+    return () => unsubs.forEach((u) => u());
+  }, []);
+
+  // Debounced save — one independent effect PER field, not one combined effect.
+  //
+  // Bug this fixes: the old version watched all 6 fields in a single effect and,
+  // 400ms after ANY of them changed, re-wrote ALL 6 to Firebase — including the
+  // ones that hadn't actually changed on this device. If another device had
+  // saved a newer edit to e.g. "players" in the meantime that this device's
+  // listener hadn't received yet, this device would blindly write its own
+  // stale local copy of "players" back over it while saving an unrelated
+  // "meta" edit — silently reverting the other device's change. Splitting
+  // into one effect per field means editing "meta" only ever (re-)saves
+  // "meta", never any other field.
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => setShared(SHARED_KEYS.meta, state.meta), 400);
+    return () => clearTimeout(t);
+  }, [state.meta, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => setShared(SHARED_KEYS.players, state.players), 400);
+    return () => clearTimeout(t);
+  }, [state.players, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => setShared(SHARED_KEYS.clubs, state.clubs), 400);
+    return () => clearTimeout(t);
+  }, [state.clubs, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => setShared(SHARED_KEYS.playerPool, state.playerPool), 400);
+    return () => clearTimeout(t);
+  }, [state.playerPool, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => setShared(SHARED_KEYS.motorik, state.motorik), 400);
+    return () => clearTimeout(t);
+  }, [state.motorik, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => setShared(SHARED_KEYS.doubles, state.doubles), 400);
+    return () => clearTimeout(t);
+  }, [state.doubles, loaded]);
+
+  const openMatch = (id) => setActiveMatch(id);
+
+  const unlockAdmin = () => { setIsAdmin(true); setAdminAuth(true); };
+  const lockAdmin = () => { setIsAdmin(false); setAdminAuth(false); };
+
+  const tabs = [
+    { key: "live", label: "Live" },
+    { key: "matches", label: "Spiele" },
+    { key: "setup", label: "Setup", admin: true },
+    { key: "motorik", label: "Motorik", admin: true },
+    { key: "report", label: "Bericht", admin: true },
+    { key: "info", label: "Info" },
+  ];
+
+  return (
+    <div className="app-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+        :root{
+          --btv-green:#0E6B3E;
+          --btv-green-dark:#0A4A2B;
+          --btv-green-light:#E4F1EA;
+          --btv-blue:#0072BC;
+          --btv-blue-dark:#00548C;
+          --btv-blue-light:#E3F1FA;
+          --paper:#F4F7F5;
+          --surface:#FFFFFF;
+          --line:#DCE5E0;
+          --ink:#132A20;
+          --slate:#5E7267;
+          --warn:#C1272D;
+        }
+        *{box-sizing:border-box;}
+        .app-root{
+          font-family:'Inter',sans-serif;
+          background:var(--paper);
+          color:var(--ink);
+          min-height:100vh;
+          padding-bottom:76px;
+        }
+        .screen{ padding:16px 14px 8px; max-width:520px; margin:0 auto; }
+        .screen-title{
+          font-family:'Oswald',sans-serif;
+          font-weight:600;
+          letter-spacing:0.04em;
+          text-transform:uppercase;
+          font-size:1.3rem;
+          margin:6px 0 14px;
+          color:var(--btv-green-dark);
+          border-left:4px solid var(--btv-green);
+          padding-left:10px;
+        }
+        .card{
+          background:var(--surface);
+          border:1px solid var(--line);
+          border-radius:12px;
+          padding:14px;
+          margin-bottom:12px;
+          box-shadow:0 1px 2px rgba(10,74,43,0.05);
+        }
+        .card-head{ display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+        .field-row{ display:flex; flex-direction:column; gap:4px; margin-bottom:10px; }
+        .field-row label{ font-size:0.75rem; color:var(--slate); text-transform:uppercase; letter-spacing:0.04em; }
+        input, select{
+          background:var(--paper);
+          border:1px solid var(--line);
+          color:var(--ink);
+          border-radius:6px;
+          padding:9px 10px;
+          font-size:0.95rem;
+          font-family:'Inter',sans-serif;
+          width:100%;
+        }
+        input:focus, select:focus, textarea:focus{ outline:2px solid var(--btv-blue); outline-offset:1px; }
+        textarea{
+          background:var(--paper);
+          border:1px solid var(--line);
+          color:var(--ink);
+          border-radius:6px;
+          padding:9px 10px;
+          font-size:0.85rem;
+          font-family:'Inter',sans-serif;
+          width:100%;
+          resize:vertical;
+        }
+        .paste-area{ margin-bottom:8px; }
+        .import-panel{ margin-top:12px; padding-top:12px; border-top:1px dashed var(--line); }
+        .inline-add{ display:flex; gap:6px; }
+        .inline-add input{ flex:1; }
+        .link{ color:var(--btv-blue); text-decoration:underline; }
+        .club-chip-list{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+        .team-name-input{ flex:1; font-weight:600; }
+        .side-tag{
+          font-family:'Oswald',sans-serif;
+          font-size:0.75rem;
+          text-transform:uppercase;
+          letter-spacing:0.06em;
+          padding:3px 10px;
+          border-radius:20px;
+          white-space:nowrap;
+        }
+        .side-heim{ background:var(--btv-green); color:#fff; }
+        .side-gast{ background:var(--btv-blue); color:#fff; }
+        .players-list{ display:flex; flex-direction:column; gap:6px; }
+        .player-row{ display:flex; align-items:center; gap:8px; }
+        .player-row-fields{ flex:1; display:flex; flex-direction:column; gap:4px; min-width:0; }
+        .player-pool-select{ font-size:0.78rem; padding:6px 8px; color:var(--slate); }
+        .player-move-btns{ display:flex; flex-direction:column; gap:2px; flex-shrink:0; }
+        .player-move-btn{ padding:2px 8px; line-height:1; font-size:0.85rem; }
+        .player-pos{
+          font-family:'Oswald',sans-serif;
+          background:var(--btv-green-light);
+          color:var(--btv-green-dark);
+          border-radius:50%;
+          width:26px;height:26px;
+          display:flex;align-items:center;justify-content:center;
+          font-size:0.85rem; flex-shrink:0;
+        }
+        .player-actions{ display:flex; gap:8px; margin-top:10px; }
+        .hint{ color:var(--slate); font-size:0.82rem; line-height:1.4; margin:10px 2px; }
+
+        .btn{
+          border:none; border-radius:8px; cursor:pointer;
+          font-family:'Inter',sans-serif; font-weight:600;
+          transition:transform 0.05s ease;
+        }
+        .btn:active{ transform:scale(0.97); }
+        .btn:disabled{ opacity:0.4; cursor:not-allowed; }
+        .btn-block{ width:100%; padding:12px; font-size:0.95rem; }
+        .btn-small{ padding:7px 12px; font-size:0.8rem; }
+        .btn-big{ padding:18px 10px; font-size:1.05rem; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:0.03em; }
+        .btn-accent{ background:var(--btv-green); color:#fff; }
+        .btn-ghost{ background:transparent; color:var(--ink); border:1px solid var(--line); }
+        .btn-outline{ background:transparent; color:var(--btv-blue); border:1px solid var(--btv-blue); }
+        .btn-stop{ background:var(--btv-blue); color:#fff; }
+        .btn-heim{ background:var(--btv-green); color:#fff; }
+        .btn-gast{ background:var(--btv-blue); color:#fff; }
+
+        .ex-badge{
+          font-family:'Oswald',sans-serif; font-weight:700; font-size:1.3rem;
+          background:var(--btv-green-dark); color:#fff;
+          width:38px;height:38px;border-radius:50%;
+          display:flex;align-items:center;justify-content:center;flex-shrink:0;
+        }
+        .ex-name{ font-weight:700; }
+        .ex-desc{ font-size:0.78rem; color:var(--slate); margin-top:2px; }
+        .motorik-grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+        .motorik-col{ display:flex; flex-direction:column; gap:8px; align-items:flex-start; }
+        .stopwatch{ display:flex; flex-direction:column; gap:6px; width:100%; }
+        .stopwatch-time{ font-family:'Oswald',sans-serif; font-size:1.6rem; color:var(--btv-green-dark); }
+        .stopwatch-btns{ display:flex; gap:6px; }
+        .stopwatch-saved{ font-size:0.75rem; color:var(--btv-green); }
+        .distance-input{ display:flex; align-items:center; gap:6px; width:100%; }
+        .distance-input .unit{ color:var(--slate); font-size:0.85rem; }
+        .ex-result{
+          margin-top:10px; padding:8px 10px; border-radius:6px;
+          background:var(--btv-green-light); color:var(--btv-green-dark);
+          font-size:0.85rem; font-weight:600;
+        }
+        .ex-manual-row{ margin-top:12px; padding-top:10px; border-top:1px dashed var(--line); }
+        .ex-manual-label{ font-size:0.75rem; color:var(--slate); text-transform:uppercase; letter-spacing:0.03em; display:block; margin-bottom:6px; }
+        .ex-manual-btns{ display:flex; gap:6px; flex-wrap:wrap; }
+        .ex-manual-tag{ color:var(--slate); font-weight:400; font-style:italic; }
+
+        /* ---- Live tab: TV-broadcast style scoreboard ---- */
+        .broadcast-screen{ background:#0B1712; margin:0 -14px; padding:16px 14px 8px; border-radius:0; }
+        .bc-title{ color:#fff; border-left-color:#E10600; }
+        .bc-subhint{ color:#7C9483; margin-top:-6px; }
+        .bc-share-btn{ background:rgba(255,255,255,0.08); color:#fff; border:1px solid #1E3A2C; margin-bottom:12px; }
+        .bc-share-card{ padding:14px; }
+        .bc-share-card .share-link-box input{ background:#0E1E17; color:#fff; border-color:#1E3A2C; }
+        .bc-share-card .qr-canvas-wrap{ background:#fff; }
+        .bc-matchup{
+          display:flex; align-items:center; justify-content:center; gap:10px;
+          margin:2px 0 10px; font-family:'Oswald',sans-serif; font-size:1rem;
+          text-transform:uppercase; letter-spacing:0.02em;
+        }
+        .bc-matchup-heim{ color:#1CBB6E; }
+        .bc-matchup-gast{ color:#2DA1F0; }
+        .bc-matchup-vs{ color:#7C9483; font-size:0.75rem; }
+        .matchup-header{ display:flex; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap; }
+        .matchup-header .vs{ color:var(--slate); font-size:0.75rem; }
+        .bc-card{
+          background:#12241C; border:1px solid #1E3A2C; border-radius:8px;
+          margin-bottom:12px; overflow:hidden;
+        }
+        .bc-card-head{
+          display:flex; justify-content:space-between; align-items:center;
+          padding:6px 10px; background:#0E1E17; font-family:'Oswald',sans-serif;
+          font-size:0.78rem; letter-spacing:0.04em; text-transform:uppercase; color:#9FB3A8;
+        }
+        .bc-live-tag{ color:#fff; background:#E10600; padding:2px 8px; border-radius:3px; display:flex; align-items:center; gap:5px; font-weight:700; }
+        .bc-live-dot{ width:7px; height:7px; border-radius:50%; background:#fff; animation:bcPulse 1.1s ease-in-out infinite; }
+        @keyframes bcPulse{ 0%,100%{ opacity:1; } 50%{ opacity:0.25; } }
+        .bc-done-tag{ color:#0B1712; background:#D7DE4A; padding:2px 8px; border-radius:3px; font-weight:700; }
+        .bc-pending-tag{ color:#9FB3A8; background:rgba(255,255,255,0.08); padding:2px 8px; border-radius:3px; font-weight:700; }
+        .bc-wo{ padding:14px; color:#D7DE4A; font-size:0.9rem; text-align:center; }
+        .bc-rows{ display:flex; flex-direction:column; }
+        .bc-row{
+          display:flex; align-items:center; gap:10px; padding:9px 10px;
+          border-top:1px solid rgba(255,255,255,0.05);
+        }
+        .bc-row:first-child{ border-top:none; }
+        .bc-accent{ width:4px; align-self:stretch; border-radius:2px; flex-shrink:0; }
+        .bc-accent-heim{ background:#1CBB6E; }
+        .bc-accent-gast{ background:#2DA1F0; }
+        .bc-serve{ width:10px; color:#E10600; font-size:0.7rem; flex-shrink:0; }
+        .bc-name{
+          flex:1; color:#fff; font-family:'Inter',sans-serif; font-weight:600; font-size:0.92rem;
+          overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+        }
+        .bc-row-winner .bc-name{ color:#D7DE4A; }
+        .bc-sets{ display:flex; gap:4px; flex-shrink:0; }
+        .bc-set-cell{
+          width:22px; height:26px; display:flex; align-items:center; justify-content:center;
+          font-family:'Oswald',sans-serif; font-size:0.85rem; color:#9FB3A8;
+          background:rgba(255,255,255,0.05); border-radius:4px;
+        }
+        .bc-set-cell-active{ background:#1E3A2C; color:#fff; font-weight:700; }
+        .bc-point{
+          min-width:34px; text-align:center; font-family:'Oswald',sans-serif; font-weight:700; font-size:1.15rem;
+          color:#fff; background:#1E3A2C; border-radius:4px; padding:3px 6px; flex-shrink:0;
+        }
+        .bc-trophy{ font-size:1rem; flex-shrink:0; }
+        .broadcast-screen .total-card{ background:#12241C; border-color:#1E3A2C; }
+        .broadcast-screen .total-card *{ color:#fff; }
+
+        .total-card{ background:var(--btv-green-dark); border-color:var(--btv-green-dark); }
+        .total-card, .total-card *{ color:#fff; }
+        .total-row{ display:flex; justify-content:space-between; align-items:center; padding:5px 0; }
+        .total-final{ border-top:1px solid rgba(255,255,255,0.25); margin-top:4px; padding-top:10px; font-weight:700; }
+        .total-score{ font-family:'Oswald',sans-serif; font-size:1.2rem; }
+        .verdict{ margin-top:8px; text-align:center; font-family:'Oswald',sans-serif; font-size:1rem; color:#fff; text-transform:uppercase; letter-spacing:0.03em; }
+
+        .chip{ display:inline-block; padding:3px 9px; border-radius:20px; font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.03em; }
+        .chip-default{ background:var(--btv-green-light); color:var(--btv-green-dark); }
+        .chip-live{ background:var(--btv-blue-light); color:var(--btv-blue-dark); }
+        .chip-done{ background:var(--btv-green); color:#fff; }
+        .chip-pending{ background:var(--paper); color:var(--slate); border:1px solid var(--line); }
+
+        .screen-title-row{ display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:14px; }
+        .screen-title-row .screen-title{ margin-bottom:0; }
+        .live-score-row{ display:flex; justify-content:space-between; align-items:center; font-size:0.85rem; color:var(--btv-blue-dark); margin-bottom:4px; }
+        .live-points{ font-family:'Oswald',sans-serif; font-weight:700; font-size:1.1rem; color:var(--btv-green-dark); }
+        .match-card-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+        .auto-wo-note{ font-size:0.78rem; color:#9C1F24; background:#FBEAEA; border-radius:6px; padding:8px 10px; margin-bottom:10px; line-height:1.4; }
+        .match-label{ font-family:'Oswald',sans-serif; letter-spacing:0.03em; color:var(--btv-green-dark); }
+        .doubles-select{ display:flex; gap:14px; margin-bottom:10px; flex-wrap:wrap; }
+        .doubles-side{ display:flex; flex-direction:column; gap:6px; flex:1; min-width:130px; }
+        .match-names{ display:flex; align-items:center; gap:8px; font-size:0.9rem; margin-bottom:8px; flex-wrap:wrap; }
+        .match-names .vs{ color:var(--slate); font-size:0.75rem; }
+        .match-summary{ font-size:0.82rem; color:var(--btv-blue-dark); margin-bottom:10px; }
+        .share-link-box{ margin-top:8px; }
+        .share-link-box input{ font-size:0.75rem; }
+        .match-share-row{ display:flex; gap:8px; margin-top:8px; }
+        .match-share-row .btn{ flex:1; }
+        .admin-reset-btn{ width:100%; margin-top:8px; color:var(--warn); border:1px solid var(--warn); }
+        .qr-box{ margin-top:12px; display:flex; flex-direction:column; align-items:center; text-align:center; }
+        .qr-canvas-wrap{ background:#fff; padding:10px; border-radius:8px; border:1px solid var(--line); display:inline-block; }
+        .qr-hint{ max-width:220px; margin:8px auto 0; }
+        .danger-card{ border-color:var(--warn); }
+        .danger-btn{ background:var(--warn); color:#fff; }
+        .setup-lock-banner{
+          display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;
+          background:#FBEAEA; border:1px solid var(--warn); color:#9C1F24; border-radius:8px;
+          padding:10px 12px; margin-bottom:14px; font-size:0.82rem;
+        }
+        .setup-lock-banner-open{ background:var(--btv-green-light); border-color:var(--btv-green); color:var(--btv-green-dark); }
+        .setup-lock-wrap{ transition:opacity 0.15s ease; }
+        .setup-locked{ opacity:0.55; filter:grayscale(0.35); pointer-events:none; user-select:none; }
+
+        .overlay{
+          position:fixed; inset:0; background:rgba(10,32,20,0.55); z-index:50;
+          display:flex; align-items:flex-start; justify-content:center; overflow-y:auto;
+        }
+        .overlay-inner{ width:100%; max-width:520px; padding:14px; }
+        .overlay-header{ display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+        .overlay-title{ font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:0.05em; color:#fff; }
+        .overlay-header .btn-ghost{ background:rgba(255,255,255,0.9); }
+        .kiosk-badge{ font-size:0.72rem; color:#fff; background:rgba(255,255,255,0.15); padding:4px 10px; border-radius:20px; }
+        .scoreboard{ background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:18px 14px; text-align:center; box-shadow:0 4px 16px rgba(10,32,20,0.15); }
+        .sync-note{ font-size:0.75rem; color:var(--btv-blue-dark); margin-bottom:8px; }
+        .scoreboard-names{ display:flex; justify-content:space-between; align-items:center; font-weight:700; margin-bottom:10px; gap:8px; color:var(--ink); }
+        .scoreboard-names .net{ color:var(--slate); }
+        .sets-row{ display:flex; gap:6px; justify-content:center; flex-wrap:wrap; margin-bottom:14px; }
+        .games-line{ font-size:0.95rem; margin-bottom:6px; color:var(--ink); }
+        .tb-note{ color:var(--btv-blue); font-size:0.8rem; }
+        .points-flip{
+          font-family:'Oswald',sans-serif; font-weight:700; font-size:3rem;
+          background:var(--btv-green-dark); color:#fff; border-radius:10px; padding:10px 0; margin:10px 0 18px;
+          letter-spacing:0.02em;
+        }
+        .score-buttons{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:14px; }
+        .court-indicator{ margin:0 0 14px; }
+        .court-svg{ width:100%; height:auto; max-height:140px; display:block; border-radius:8px; }
+        .court-caption{ display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; font-size:0.72rem; color:var(--slate); margin-top:6px; }
+        .court-legend{ display:flex; align-items:center; gap:5px; }
+        .court-dot-legend{ width:10px; height:10px; border-radius:50%; display:inline-block; flex-shrink:0; }
+        .court-flip-row{ display:flex; gap:8px; margin-top:8px; }
+        .court-flip-row .btn{ flex:1; }
+        .secondary-actions{ display:flex; gap:8px; margin-bottom:14px; }
+        .secondary-actions .btn{ flex:1; }
+        .wo-actions{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:center; font-size:0.78rem; color:var(--slate); }
+        .wo-label{ width:100%; }
+        .finished-panel{ padding:10px 0; }
+        .winner-banner{ font-family:'Oswald',sans-serif; font-size:1.2rem; margin-bottom:10px; color:var(--btv-green-dark); }
+        .deuce-backdrop{
+          position:fixed; inset:0; background:rgba(10,32,20,0.6); z-index:60;
+          display:flex; align-items:center; justify-content:center; padding:20px;
+        }
+        .deuce-modal{
+          background:var(--surface); border-radius:14px; padding:20px 18px; max-width:360px; width:100%;
+          box-shadow:0 8px 28px rgba(10,32,20,0.3); text-align:center;
+        }
+        .deuce-title{ font-family:'Oswald',sans-serif; font-weight:700; font-size:1.15rem; color:var(--btv-green-dark); margin-bottom:10px; letter-spacing:0.02em; }
+        .deuce-text{ font-size:0.88rem; line-height:1.5; color:var(--ink); margin-bottom:16px; }
+        .serve-setup-btns{ display:flex; flex-direction:column; gap:8px; }
+
+        .report-head{ text-align:center; }
+        .report-nr{ font-size:0.8rem; color:var(--slate); margin:4px 0; }
+        .report-teams{ font-size:1.05rem; margin-top:6px; color:var(--btv-green-dark); }
+        .table-card table{ width:100%; border-collapse:collapse; font-size:0.85rem; }
+        .table-title{ font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:8px; color:var(--btv-green-dark); }
+        .table-card th, .table-card td{ border-bottom:1px solid var(--line); padding:6px 4px; text-align:left; }
+        .table-card th{ color:var(--slate); font-weight:500; font-size:0.72rem; text-transform:uppercase; }
+        .row-gast td{ color:var(--ink); opacity:0.75; }
+
+        .navbar{
+          position:fixed; bottom:0; left:0; right:0;
+          display:flex; background:var(--surface);
+          border-top:1px solid var(--line);
+          box-shadow:0 -2px 8px rgba(10,32,20,0.06);
+          z-index:40;
+        }
+        .navbar button{
+          flex:1; background:none; border:none; color:var(--slate);
+          padding:12px 4px; font-family:'Oswald',sans-serif; font-size:0.78rem;
+          text-transform:uppercase; letter-spacing:0.04em; cursor:pointer;
+        }
+        .navbar button.active{ color:var(--btv-green); border-top:2px solid var(--btv-green); }
+
+        @media print{
+          @page{ size: landscape; margin: 10mm; }
+          .navbar, .no-print{ display:none !important; }
+          .app-root{ background:white; color:black; padding-bottom:0; }
+          .screen{ max-width:none; padding:0; }
+          .card{ background:white; border:1px solid #999; color:black; box-shadow:none; }
+        }
+
+        /* ---- Official Spielbericht sheet (screen + print) ---- */
+        .official-sheet{
+          background:#fff; color:#111; border:1px solid var(--line); border-radius:8px;
+          padding:14px; margin-bottom:14px; overflow-x:auto;
+        }
+        .official-head{ margin-bottom:10px; }
+        .official-head-row{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap; }
+        .official-head-left{ flex:1; min-width:200px; }
+        .official-brandmark{ display:flex; gap:14px; flex-shrink:0; }
+        .official-brand-esb, .official-brand-btv{
+          display:flex; flex-direction:column; align-items:center; font-weight:800; font-size:1.1rem;
+          color:#111; border:1px solid #ccc; border-radius:6px; padding:6px 10px; min-width:90px; text-align:center;
+        }
+        .official-brand-esb span, .official-brand-btv span{ font-size:0.5rem; font-weight:500; letter-spacing:0.03em; margin-top:2px; }
+        .official-sponsor-row{
+          display:flex; justify-content:center; align-items:center; gap:8px; flex-wrap:wrap;
+          margin-top:22px; padding-top:10px; border-top:1px solid #ddd; font-size:0.72rem; color:#666;
+        }
+        .official-saison{ font-weight:700; font-size:1rem; }
+        .official-liga{ font-weight:700; font-size:0.92rem; margin-top:2px; }
+        .official-nr{ font-size:0.8rem; color:#444; margin-top:4px; }
+        .official-teams{ font-size:0.92rem; margin-top:6px; }
+        .official-table-title{ font-weight:700; font-size:0.85rem; margin:12px 0 4px; }
+        .official-table{ border-collapse:collapse; font-size:0.68rem; white-space:nowrap; min-width:760px; }
+        .official-table th, .official-table td{
+          border:1px solid #999; padding:3px 5px; text-align:center; color:#111;
+        }
+        .official-table thead th{ background:#f0f0f0; font-weight:600; }
+        .official-table td:nth-child(3), .official-table td:nth-child(6){ text-align:left; white-space:normal; min-width:90px; }
+        .official-sum-row td{ font-weight:600; text-align:left; background:#fafafa; }
+        .official-wo-cell{ color:#C1272D; font-weight:600; font-style:italic; }
+        .official-sum-row td:not(:first-child){ text-align:center; }
+        .official-total-row td{ background:#eef3ef; font-weight:700; }
+        .official-signrow{ display:flex; gap:24px; margin-top:26px; flex-wrap:wrap; }
+        .official-sign-col{ flex:1; min-width:160px; }
+        .official-osr-col{ flex:1; min-width:160px; }
+        .official-osr-title{ font-weight:700; font-size:0.82rem; margin-bottom:14px; }
+        .official-sign-line{ border-bottom:1px solid #333; min-height:18px; margin-bottom:3px; font-size:0.8rem; }
+        .official-sign-label{ font-size:0.68rem; color:#555; }
+        .official-remarks{ margin-top:18px; }
+        .official-remarks-box{ border:1px solid #999; border-radius:4px; min-height:40px; padding:6px 8px; font-size:0.8rem; margin-top:4px; }
+
+        /* ---- Info / help tab ---- */
+        .info-overview{ padding:10px; }
+        .info-overview-table{ width:100%; border-collapse:collapse; font-size:0.82rem; }
+        .info-overview-table th, .info-overview-table td{ border:1px solid var(--line); padding:6px 8px; text-align:left; }
+        .info-overview-table th{ background:var(--btv-green-light); color:var(--btv-green-dark); }
+        .info-section-title{ font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:0.03em; color:var(--btv-green-dark); margin:20px 2px 8px; font-size:0.95rem; }
+        .info-card{ overflow:hidden; }
+        .info-shot{ width:100%; max-width:260px; display:block; margin:0 auto 12px; border:1px solid var(--line); border-radius:10px; box-shadow:0 2px 8px rgba(10,74,43,0.1); }
+        .info-steps{ margin:0 0 8px; padding-left:20px; font-size:0.88rem; line-height:1.5; }
+        .info-steps li{ margin-bottom:6px; }
+        .info-hint{ font-size:0.8rem; color:var(--btv-green-dark); background:var(--btv-green-light); border-radius:6px; padding:8px 10px; margin-top:8px; }
+        .info-faq{ font-size:0.85rem; line-height:1.5; margin-bottom:14px; }
+        .info-faq:last-child{ margin-bottom:0; }
+        .sig-image{ display:block; max-height:50px; max-width:100%; object-fit:contain; border-bottom:1px solid #333; margin-bottom:3px; }
+        .sigpad-modal{ max-width:520px; }
+        .sigpad-canvas{
+          width:100%; height:160px; touch-action:none; background:#fff;
+          border:2px dashed var(--line); border-radius:8px; display:block;
+        }
+        .sigpad-actions{ display:flex; gap:8px; }
+        .sigpad-actions .btn{ flex:1; }
+        @media print{ .sig-image{ max-height:40px; } }
+        .osr-kiosk{ padding-top:24px; }
+        .sig-image-large{ max-height:120px; width:100%; object-fit:contain; background:#fff; border:1px solid var(--line); border-radius:6px; }
+      `}</style>
+
+      {osrKiosk ? (
+        <OsrSignScreen state={state} setState={setState} />
+      ) : liveKiosk ? (
+        <LiveScreen state={state} openMatch={() => {}} />
+      ) : kioskMatch ? (
+        <LiveMatchOverlay state={state} setState={setState} matchId={kioskMatch} close={null} matchesReady={matchesReady} />
+      ) : (
+        <>
+          {screen === "live" && <LiveScreen state={state} openMatch={openMatch} />}
+          {screen === "matches" && <MatchesScreen state={state} setState={setState} openMatch={openMatch} isAdmin={isAdmin} />}
+          {screen === "setup" && (isAdmin ? <SetupScreen state={state} setState={setState} onLockAdmin={lockAdmin} /> : <AdminGate onUnlock={unlockAdmin} />)}
+          {screen === "motorik" && (isAdmin ? <MotorikScreen state={state} setState={setState} /> : <AdminGate onUnlock={unlockAdmin} />)}
+          {screen === "report" && (isAdmin ? <ReportScreen state={state} setState={setState} /> : <AdminGate onUnlock={unlockAdmin} />)}
+          {screen === "info" && <InfoScreen />}
+
+          {activeMatch && (
+            <LiveMatchOverlay state={state} setState={setState} matchId={activeMatch} close={() => setActiveMatch(null)} matchesReady={matchesReady} />
+          )}
+
+          <nav className="navbar">
+            {tabs.map((t) => (
+              <button key={t.key} className={screen === t.key ? "active" : ""} onClick={() => setScreen(t.key)}>
+                {t.label}{t.admin && !isAdmin ? " 🔒" : ""}
+              </button>
+            ))}
+          </nav>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---------- Error boundary: shows a visible message instead of a blank
+   white screen if something throws during render, and offers a reload. ---------- */
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    // still log to console for anyone with devtools open
+    console.error("App crashed:", error, info);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ fontFamily: "sans-serif", maxWidth: 480, margin: "60px auto", padding: 20, border: "2px solid #C1272D", borderRadius: 10, color: "#132A20", lineHeight: 1.5 }}>
+          <strong>Etwas ist schiefgelaufen.</strong>
+          <p>
+            Die App ist auf einen Fehler gestoßen und konnte nicht weiter angezeigt werden. Bitte Seite neu laden. Falls
+            das wiederholt passiert, bitte einen Screenshot dieser Meldung (inkl. Text unten) weitergeben.
+          </p>
+          <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, background: "#F4F7F5", padding: 10, borderRadius: 6, overflow: "auto" }}>
+            {String((this.state.error && this.state.error.stack) || this.state.error)}
+          </pre>
+          <button
+            style={{ marginTop: 10, padding: "10px 16px", background: "#0E6B3E", color: "#fff", border: "none", borderRadius: 8, fontWeight: 600 }}
+            onClick={() => window.location.reload()}
+          >
+            Seite neu laden
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const rootEl = document.getElementById("root");
+ReactDOM.createRoot(rootEl).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);
+</script>
+
+<!-- Manually transform the app source above with Babel, forcing the
+     "classic" JSX runtime (React.createElement calls). The newer automatic
+     runtime that Babel's react preset uses by default emits an
+     `import ... from "react/jsx-runtime"` statement, which breaks when run
+     as a plain (non-module) script — that was the "Cannot use import
+     statement outside a module" error. -->
+<script>
+  const src = document.getElementById("app-source").textContent;
+  const { code } = Babel.transform(src, { presets: [["react", { runtime: "classic" }]] });
+  const runnable = document.createElement("script");
+  runnable.textContent = code;
+  document.body.appendChild(runnable);
+</script>
+</body>
+</html>
